@@ -1,0 +1,9 @@
+[mcp_servers.salesforce]
+command = "npx"
+args = ["-y", "@salesforcecli/mcp"]
+startup_timeout_sec = 30
+tool_timeout_sec = 120
+
+[mcp_servers.salesforce.env]
+SALESFORCE_MCP_ORGS = "ameyo"
+SALESFORCE_MCP_TOOLSETS = "orgs,data,metadata,users"

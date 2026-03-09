@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "salesforce": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@salesforcecli/mcp"],
+      "env": {
+        "SALESFORCE_MCP_ORGS": "ameyo",
+        "SALESFORCE_MCP_TOOLSETS": "orgs,data,metadata,users"
+      }
+    }
+  }
+}

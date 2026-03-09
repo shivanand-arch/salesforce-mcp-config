@@ -72,7 +72,7 @@ Once connected, ask questions in natural language:
 
 ## Salesforce Org Details
 
-- **Org**: ameyo
+- **Org**: Exotel
 - **URL**: https://ameyo.my.salesforce.com
 - **Toolsets**: orgs, data, metadata, users
 

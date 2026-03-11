@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>62.0</apiVersion>
+    <isExposed>true</isExposed>
+    <masterLabel>Ask Salesforce</masterLabel>
+    <description>AI-powered natural language assistant for querying Salesforce data</description>
+    <targets>
+        <target>lightning__AppPage</target>
+        <target>lightning__RecordPage</target>
+        <target>lightning__HomePage</target>
+        <target>lightning__UtilityBar</target>
+    </targets>
+    <targetConfigs>
+        <targetConfig targets="lightning__AppPage,lightning__HomePage,lightning__RecordPage">
+            <property name="chatTitle" type="String" default="Ask Salesforce"
+                label="Chat Title" description="Title displayed at the top of the chat widget"/>
+            <property name="placeholderText" type="String"
+                default="Ask about pipeline, deals, leads, cases..."
+                label="Placeholder Text"/>
+        </targetConfig>
+    </targetConfigs>
+</LightningComponentBundle>

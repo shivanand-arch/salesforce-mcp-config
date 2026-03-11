@@ -1,0 +1,116 @@
+<template>
+    <div class="app-container">
+        <!-- Header -->
+        <div class="app-header">
+            <div class="header-left">
+                <lightning-icon icon-name="standard:bot" size="small"></lightning-icon>
+                <h1 class="header-title">{chatTitle}</h1>
+            </div>
+        </div>
+
+        <!-- Chat message area -->
+        <div class="chat-container" lwc:ref="chatContainer">
+
+            <!-- Welcome message -->
+            <template lwc:if={showWelcome}>
+                <div class="welcome-box">
+                    <lightning-icon icon-name="standard:bot" size="large"></lightning-icon>
+                    <h2 class="welcome-title">Ask Salesforce</h2>
+                    <p class="welcome-text">Ask me anything about your pipeline, deals, leads, cases and more. I'll query Salesforce and summarize the results for you.</p>
+                    <div class="suggested-questions">
+                        <button class="suggestion-chip" onclick={handleSuggestion} data-question="How many deals closed this quarter?">How many deals closed this quarter?</button>
+                        <button class="suggestion-chip" onclick={handleSuggestion} data-question="Show me opportunities that have not moved stages in the last 30 days">Show stale pipeline deals</button>
+                        <button class="suggestion-chip" onclick={handleSuggestion} data-question="Show top 10 open opportunities by MRR amount">Top 10 deals by MRR</button>
+                        <button class="suggestion-chip" onclick={handleSuggestion} data-question="How many open cases are escalated to Jira?">Open Jira-escalated cases</button>
+                    </div>
+                </div>
+            </template>
+
+            <!-- Messages -->
+            <template for:each={messages} for:item="msg">
+                <div key={msg.id} class={msg.containerClass}>
+                    <div class={msg.bubbleClass}>
+                        <!-- User message -->
+                        <template lwc:if={msg.isUser}>
+                            <p class="message-text">{msg.text}</p>
+                        </template>
+
+                        <!-- Assistant message -->
+                        <template lwc:if={msg.isAssistant}>
+                            <lightning-formatted-rich-text value={msg.formattedText}></lightning-formatted-rich-text>
+
+                            <!-- SOQL toggle -->
+                            <template lwc:if={msg.soqlQuery}>
+                                <div class="soql-section">
+                                    <button class="soql-toggle-btn" onclick={handleSoqlToggle} data-msg-id={msg.id}>
+                                        <lightning-icon icon-name="utility:code" size="xx-small" class="soql-icon"></lightning-icon>
+                                        {msg.soqlToggleLabel}
+                                    </button>
+                                    <template lwc:if={msg.showSoql}>
+                                        <pre class="soql-display">{msg.soqlQuery}</pre>
+                                    </template>
+                                </div>
+                            </template>
+
+                            <!-- Metadata badges -->
+                            <template lwc:if={msg.recordCount}>
+                                <div class="message-meta">
+                                    <span class="meta-badge records">{msg.recordCountLabel}</span>
+                                    <span class="meta-badge time">{msg.executionTimeLabel}</span>
+                                </div>
+                            </template>
+                        </template>
+
+                        <!-- Error message -->
+                        <template lwc:if={msg.isError}>
+                            <div class="error-content">
+                                <lightning-icon icon-name="utility:warning" size="x-small" variant="error"></lightning-icon>
+                                <p class="error-text">{msg.text}</p>
+                            </div>
+                        </template>
+
+                        <span class="message-time">{msg.timestamp}</span>
+                    </div>
+                </div>
+            </template>
+
+            <!-- Typing indicator -->
+            <template lwc:if={isLoading}>
+                <div class="message-row assistant">
+                    <div class="message-bubble assistant">
+                        <div class="typing-indicator">
+                            <span class="dot"></span>
+                            <span class="dot"></span>
+                            <span class="dot"></span>
+                        </div>
+                        <span class="typing-text">Querying Salesforce...</span>
+                    </div>
+                </div>
+            </template>
+        </div>
+
+        <!-- Input area -->
+        <div class="input-container">
+            <lightning-input
+                type="text"
+                placeholder={placeholderText}
+                value={userInput}
+                onchange={handleInputChange}
+                onkeyup={handleKeyUp}
+                disabled={isLoading}
+                variant="label-hidden"
+                label="Question"
+                class="input-field">
+            </lightning-input>
+            <lightning-button-icon
+                icon-name="utility:send"
+                alternative-text="Send"
+                onclick={handleSend}
+                disabled={isSendDisabled}
+                variant="brand"
+                size="medium"
+                class="send-button">
+            </lightning-button-icon>
+        </div>
+    </div>
+</template>

@@ -1,5 +1,7 @@
 import { LightningElement, api, track } from 'lwc';
+import { loadScript } from 'lightning/platformResourceLoader';
 import askQuestion from '@salesforce/apex/AiSalesAssistantController.askQuestion';
+import CHARTJS from '@salesforce/resourceUrl/ChartJsLib';
 
 export default class AskSalesforce extends LightningElement {
     @api chatTitle = 'Ask Salesforce';
@@ -11,6 +13,9 @@ export default class AskSalesforce extends LightningElement {
 
     messageIdCounter = 0;
     conversationHistory = [];
+    chartJsLoaded = false;
+    chartInstances = new Map(); // msgId -> Chart instance
+    renderedChartIds = new Set(); // track which message charts have been rendered
 
     get showWelcome() {
         return this.messages.length === 0 && !this.isLoading;
@@ -18,6 +23,53 @@ export default class AskSalesforce extends LightningElement {
 
     get isSendDisabled() {
         return this.isLoading || !this.userInput || !this.userInput.trim();
+    }
+
+    // --- Lifecycle Hooks ---
+
+    connectedCallback() {
+        // Polyfill ResizeObserver if missing (Salesforce Locker Service blocks it)
+        if (typeof window.ResizeObserver === 'undefined') {
+            window.ResizeObserver = class ResizeObserver {
+                constructor() { this._cb = null; }
+                observe() {}
+                unobserve() {}
+                disconnect() {}
+            };
+        }
+        // Guard: loadScript crashes if the resource URL is null (e.g. cache miss after deploy)
+        if (CHARTJS) {
+            loadScript(this, CHARTJS)
+                .then(() => {
+                    this.chartJsLoaded = true;
+                })
+                .catch(error => {
+                    console.error('Failed to load Chart.js:', error);
+                });
+        }
+    }
+
+    renderedCallback() {
+        // Render any charts that have config but haven't been drawn yet
+        this.messages.forEach(msg => {
+            if (msg.hasChart && !this.renderedChartIds.has(msg.id)) {
+                const canvas = this.template.querySelector(`canvas[data-msg-id="${msg.id}"]`);
+                if (canvas) {
+                    this.renderedChartIds.add(msg.id);
+                    try {
+                        this.renderChart(canvas, msg.chartConfig, msg.id);
+                    } catch (e) {
+                        console.error('Chart render failed for msg ' + msg.id + ':', e);
+                    }
+                }
+            }
+        });
+    }
+
+    disconnectedCallback() {
+        // Clean up all chart instances to prevent memory leaks
+        this.chartInstances.forEach(chart => chart.destroy());
+        this.chartInstances.clear();
     }
 
     // --- Event Handlers ---
@@ -115,15 +167,24 @@ export default class AskSalesforce extends LightningElement {
     }
 
     addAssistantMessage(text, soqlQuery, recordCount, executionTimeMs) {
-        const msg = this.createBaseMessage(text);
+        const safeText = text || '';
+        const msg = this.createBaseMessage(safeText);
         msg.isUser = false;
         msg.isAssistant = true;
         msg.isError = false;
         msg.containerClass = 'message-row assistant';
         msg.bubbleClass = 'message-bubble assistant';
 
+        // Extract chart config from response text (if present)
+        const { cleanText, chartConfig } = this.extractChartConfig(safeText);
+
         // Format the text - convert markdown-like formatting to HTML
-        msg.formattedText = this.formatResponse(text);
+        msg.formattedText = this.formatResponse(cleanText);
+
+        // Chart data
+        msg.chartConfig = chartConfig;
+        msg.hasChart = chartConfig !== null && this.chartJsLoaded;
+        msg.chartRendered = false;
 
         // SOQL
         msg.soqlQuery = soqlQuery;
@@ -161,6 +222,191 @@ export default class AskSalesforce extends LightningElement {
             text: text,
             timestamp: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         };
+    }
+
+    // --- Chart Extraction & Rendering ---
+
+    extractChartConfig(text) {
+        if (!text) return { cleanText: '', chartConfig: null };
+
+        // Try multiple patterns to handle LLM formatting variations
+        const patterns = [
+            /```chartConfig\s*\n([\s\S]*?)\n\s*```\s*$/,        // Standard: newlines around JSON
+            /```chartConfig\s*\r?\n?([\s\S]*?)\r?\n?\s*```\s*$/, // Flexible newlines
+            /```chartConfig\s+([\s\S]*?)\s*```\s*$/,              // Any whitespace separator
+            /```chartConfig\s*(\{[\s\S]*\})\s*```\s*$/,           // JSON object directly
+        ];
+
+        let match = null;
+        let matchedPattern = null;
+        for (const pattern of patterns) {
+            match = text.match(pattern);
+            if (match) {
+                matchedPattern = pattern;
+                break;
+            }
+        }
+
+        if (!match) return { cleanText: text, chartConfig: null };
+
+        let chartConfig = null;
+        try {
+            chartConfig = JSON.parse(match[1].trim());
+            // Validate minimum required fields
+            if (!chartConfig.type || !chartConfig.labels || !chartConfig.datasets ||
+                !Array.isArray(chartConfig.labels) || !Array.isArray(chartConfig.datasets)) {
+                chartConfig = null;
+            }
+        } catch (e) {
+            console.warn('Failed to parse chartConfig:', e);
+            chartConfig = null;
+        }
+
+        // Remove the chartConfig block from the display text
+        const cleanText = text.replace(matchedPattern, '').trim();
+        return { cleanText, chartConfig };
+    }
+
+    renderChart(canvas, config, msgId) {
+        // Destroy existing chart on same canvas if any
+        if (this.chartInstances.has(msgId)) {
+            this.chartInstances.get(msgId).destroy();
+            this.chartInstances.delete(msgId);
+        }
+
+        // Set explicit canvas dimensions (responsive: false avoids ResizeObserver)
+        const container = canvas.parentElement;
+        const containerWidth = container ? container.clientWidth - 24 : 700; // minus padding
+        const containerHeight = container ? container.clientHeight - 24 : 276;
+        canvas.width = containerWidth;
+        canvas.height = containerHeight;
+        canvas.style.width = containerWidth + 'px';
+        canvas.style.height = containerHeight + 'px';
+
+        const ctx = canvas.getContext('2d');
+
+        // Map our chart types to Chart.js types
+        const chartType = config.type === 'horizontalBar' ? 'bar'
+                        : config.type === 'stackedBar' ? 'bar'
+                        : config.type;
+
+        const isHorizontal = config.type === 'horizontalBar';
+        const isStacked = config.type === 'stackedBar';
+
+        // SLDS-aligned color palette
+        const colors = [
+            '#0176d3', '#04844b', '#f38303', '#ba0517', '#7526c3',
+            '#00a1e0', '#ff538a', '#76ded9', '#e3a21a', '#2e844a',
+            '#5a6872', '#1b5297'
+        ];
+
+        const isPieType = config.type === 'pie' || config.type === 'doughnut';
+        const backgroundColors = isPieType
+            ? colors.slice(0, config.labels.length)
+            : undefined;
+
+        const datasets = config.datasets.map((ds, idx) => ({
+            label: ds.label,
+            data: ds.data,
+            backgroundColor: backgroundColors || colors[idx % colors.length],
+            borderColor: config.type === 'line' ? colors[idx % colors.length] : undefined,
+            borderWidth: config.type === 'line' ? 2 : 1,
+            tension: config.type === 'line' ? 0.3 : undefined,
+            fill: config.type === 'line' ? false : undefined,
+        }));
+
+        // Tooltip value formatter
+        const formatValue = (value) => {
+            if (config.valueFormat === 'currency' && config.currency === 'INR') {
+                if (Math.abs(value) >= 10000000) return '\u20B9' + (value / 10000000).toFixed(2) + ' Cr';
+                if (Math.abs(value) >= 100000) return '\u20B9' + (value / 100000).toFixed(2) + ' L';
+                return '\u20B9' + value.toLocaleString('en-IN');
+            }
+            if (config.valueFormat === 'percent') return value + '%';
+            if (typeof value === 'number') return value.toLocaleString();
+            return value;
+        };
+
+        // Axis tick formatter
+        const tickCallback = function(value) {
+            if (config.valueFormat === 'currency' && config.currency === 'INR') {
+                if (Math.abs(value) >= 10000000) return '\u20B9' + (value / 10000000).toFixed(1) + 'Cr';
+                if (Math.abs(value) >= 100000) return '\u20B9' + (value / 100000).toFixed(1) + 'L';
+                return '\u20B9' + value.toLocaleString('en-IN');
+            }
+            if (config.valueFormat === 'percent') return value + '%';
+            return value.toLocaleString();
+        };
+
+        const chartInstance = new window.Chart(ctx, {
+            type: chartType,
+            data: {
+                labels: config.labels,
+                datasets: datasets,
+            },
+            options: {
+                indexAxis: isHorizontal ? 'y' : 'x',
+                responsive: false,
+                maintainAspectRatio: false,
+                plugins: {
+                    title: {
+                        display: !!config.title,
+                        text: config.title || '',
+                        font: { size: 13, weight: '600' },
+                        color: '#032d60',
+                        padding: { bottom: 12 },
+                    },
+                    legend: {
+                        display: config.datasets.length > 1 || isPieType,
+                        position: isPieType ? 'right' : 'top',
+                        labels: {
+                            font: { size: 11 },
+                            color: '#5a6872',
+                            boxWidth: 12,
+                        },
+                    },
+                    tooltip: {
+                        callbacks: {
+                            label: (tooltipItem) => {
+                                const label = tooltipItem.dataset.label || '';
+                                const val = formatValue(tooltipItem.raw);
+                                return label ? label + ': ' + val : val;
+                            },
+                        },
+                    },
+                },
+                scales: isPieType ? {} : {
+                    x: {
+                        stacked: isStacked,
+                        title: {
+                            display: !!config.xAxisLabel,
+                            text: config.xAxisLabel || '',
+                            color: '#5a6872',
+                            font: { size: 11 },
+                        },
+                        ticks: { font: { size: 10 }, color: '#5a6872' },
+                        grid: { display: false },
+                    },
+                    y: {
+                        stacked: isStacked,
+                        title: {
+                            display: !!config.yAxisLabel,
+                            text: config.yAxisLabel || '',
+                            color: '#5a6872',
+                            font: { size: 11 },
+                        },
+                        ticks: {
+                            font: { size: 10 },
+                            color: '#5a6872',
+                            callback: tickCallback,
+                        },
+                        beginAtZero: true,
+                    },
+                },
+            },
+        });
+
+        this.chartInstances.set(msgId, chartInstance);
     }
 
     // --- Formatting ---

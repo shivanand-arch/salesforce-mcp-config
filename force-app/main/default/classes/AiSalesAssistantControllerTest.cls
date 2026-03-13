@@ -195,6 +195,58 @@ private class AiSalesAssistantControllerTest {
         System.assert(!resp.soqlQuery.contains('ZZZ_No_Such_Field'), 'Should not contain the bad field');
     }
 
+    /**
+     * Multi-query mock: first call returns 2 SOQL blocks, second call returns summary.
+     */
+    private class MockClaudeMultiQuery implements HttpCalloutMock {
+        private Integer callCount = 0;
+
+        public HTTPResponse respond(HTTPRequest req) {
+            callCount++;
+            HttpResponse res = new HttpResponse();
+            res.setStatusCode(200);
+            res.setHeader('Content-Type', 'application/json');
+
+            if (callCount == 1) {
+                // First call: return 2 labeled SOQL queries — use JSON serialization to handle escaping
+                String multiQueryText = '-- Query 1: Won deals\n```soql\nSELECT Id, Name FROM Account WHERE Type = \'Customer\' LIMIT 5\n```\n\n-- Query 2: All accounts\n```soql\nSELECT Id, Name FROM Account LIMIT 5\n```';
+                Map<String, Object> content1 = new Map<String, Object>{
+                    'type' => 'text',
+                    'text' => multiQueryText
+                };
+                Map<String, Object> body = new Map<String, Object>{
+                    'id' => 'msg_01',
+                    'type' => 'message',
+                    'role' => 'assistant',
+                    'content' => new List<Object>{ content1 },
+                    'model' => 'claude-sonnet-4-6',
+                    'stop_reason' => 'end_turn',
+                    'usage' => new Map<String, Object>{ 'input_tokens' => 100, 'output_tokens' => 80 }
+                };
+                res.setBody(JSON.serialize(body));
+            } else {
+                // Summary call
+                res.setBody('{"id":"msg_02","type":"message","role":"assistant","content":[{"type":"text","text":"Win rate analysis: Based on 2 query results, the overall win rate is 45% by count."}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":200,"output_tokens":30}}');
+            }
+            return res;
+        }
+    }
+
+    @isTest
+    static void testAskQuestion_MultiQuery() {
+        setupTestConfig();
+        Test.setMock(HttpCalloutMock.class, new MockClaudeMultiQuery());
+
+        Test.startTest();
+        AiSalesAssistantController.AssistantResponse resp =
+            AiSalesAssistantController.askQuestion('What is our win rate by cluster?', null);
+        Test.stopTest();
+
+        System.assertEquals(true, resp.success, 'Multi-query should succeed: ' + resp.errorMessage);
+        System.assertNotEquals(null, resp.answer, 'Should have answer');
+        System.assert(resp.soqlQuery.contains('---'), 'Should contain multi-query separator: ' + resp.soqlQuery);
+    }
+
     @isTest
     static void testAssistantResponse_Serialization() {
         AiSalesAssistantController.AssistantResponse resp = new AiSalesAssistantController.AssistantResponse();

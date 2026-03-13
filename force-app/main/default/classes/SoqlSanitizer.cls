@@ -15,7 +15,14 @@ public class SoqlSanitizer {
         'user', 'userrole', 'campaign', 'task', 'event',
         'group', 'opportunityhistory', 'opportunityfieldhistory',
         'casehistory', 'currencytype', 'recordtype',
-        'opportunitylineitem', 'product2', 'pricebookentry'
+        'opportunitylineitem', 'product2', 'pricebookentry',
+        'accounts_revenue__c', 'target__c', 'sdf__c', 'sdf_line_item__c',
+        'opportunity_trend__c', 'support_quality__c', 'survey__c',
+        'amc__c', 'legal_tickets__c', 'saas_daily_usage__c',
+        'daily_task__c', 'presalescase__c', 'deal_desk__c',
+        'ticket_movement__c', 'calldetails__c',
+        'booking_target__c', 'accounts_target__c', 'program__c',
+        'opp_related_programs__c'
     };
 
     // Blocked keywords that indicate DML or dangerous operations
@@ -70,6 +77,70 @@ public class SoqlSanitizer {
         soql = soql.replaceAll(';\\s*$', '').trim();
 
         return sanitize(soql);
+    }
+
+    /**
+     * Extracts ALL SOQL queries from an LLM response (multi-query support).
+     * Returns a list of maps with {label, soql} for each query found.
+     * Looks for labeled queries with preceding -- comment lines.
+     * Caps at 5 queries max.
+     */
+    public static List<Map<String, String>> extractAllSoql(String llmResponse) {
+        if (String.isBlank(llmResponse)) {
+            throw new SoqlValidationException('Empty response from AI - no SOQL generated.');
+        }
+
+        List<Map<String, String>> queries = new List<Map<String, String>>();
+
+        // Find ALL ```soql/```sql/``` code blocks containing SELECT
+        Pattern codeBlockPattern = Pattern.compile('```(?:soql|sql)?\\s*\\n([\\s\\S]*?)\\n\\s*```');
+        Matcher codeBlockMatcher = codeBlockPattern.matcher(llmResponse);
+
+        Integer queryIndex = 0;
+        while (codeBlockMatcher.find() && queryIndex < 5) {
+            String candidate = codeBlockMatcher.group(1).trim();
+            if (!candidate.toUpperCase().startsWith('SELECT')) continue;
+
+            // Look for a preceding -- comment label
+            String label = 'Query ' + (queryIndex + 1);
+            Integer blockStart = codeBlockMatcher.start();
+            // Search backwards from the code block start for a -- comment line
+            String textBefore = llmResponse.substring(Math.max(0, blockStart - 200), blockStart);
+            Pattern labelPattern = Pattern.compile('--\\s*(?:Query\\s*\\d+\\s*:?\\s*)?(.+?)\\s*$');
+            Matcher labelMatcher = labelPattern.matcher(textBefore.trim());
+            if (labelMatcher.find()) {
+                label = labelMatcher.group(1).trim();
+            }
+
+            // Sanitize the query
+            String sanitized = sanitize(candidate.replaceAll(';\\s*$', '').trim());
+
+            queries.add(new Map<String, String>{
+                'label' => label,
+                'soql' => sanitized
+            });
+            queryIndex++;
+        }
+
+        // Fallback: if no code blocks found, try extracting a single raw SELECT
+        if (queries.isEmpty()) {
+            Pattern selectPattern = Pattern.compile('(?i)(SELECT\\s+[\\s\\S]+?FROM\\s+[\\s\\S]+?)(?:\\n\\n|$)');
+            Matcher selectMatcher = selectPattern.matcher(llmResponse);
+            if (selectMatcher.find()) {
+                String soql = selectMatcher.group(1).trim().replaceAll(';\\s*$', '').trim();
+                String sanitized = sanitize(soql);
+                queries.add(new Map<String, String>{
+                    'label' => 'Query 1',
+                    'soql' => sanitized
+                });
+            }
+        }
+
+        if (queries.isEmpty()) {
+            throw new SoqlValidationException('Could not find a SOQL query in the AI response.');
+        }
+
+        return queries;
     }
 
     /**

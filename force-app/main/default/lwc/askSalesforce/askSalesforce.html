@@ -39,6 +39,13 @@
                         <template lwc:if={msg.isAssistant}>
                             <lightning-formatted-rich-text value={msg.formattedText}></lightning-formatted-rich-text>
 
+                            <!-- Chart visualization -->
+                            <template lwc:if={msg.hasChart}>
+                                <div class="chart-container">
+                                    <canvas data-msg-id={msg.id}></canvas>
+                                </div>
+                            </template>
+
                             <!-- SOQL toggle -->
                             <template lwc:if={msg.soqlQuery}>
                                 <div class="soql-section">

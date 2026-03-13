@@ -335,6 +335,76 @@ private class SoqlSanitizerTest {
         System.assert(result.contains('GROUP BY'), 'Should allow relationship fields in GROUP BY: ' + result);
     }
 
+    // --- extractAllSoql Multi-Query Tests ---
+
+    @isTest
+    static void testExtractAllSoql_MultipleBlocks() {
+        String input = 'Here are two queries:\n\n' +
+            '-- Query 1: Won deals by cluster\n' +
+            '```soql\nSELECT Account_Cluster__c, SUM(Amount) wonVal FROM Opportunity WHERE StageName = \'Order\' GROUP BY Account_Cluster__c LIMIT 2000\n```\n\n' +
+            '-- Query 2: All consumed deals by cluster\n' +
+            '```soql\nSELECT Account_Cluster__c, SUM(Amount) totalVal FROM Opportunity WHERE StageName IN (\'Order\',\'Closed Lost\') GROUP BY Account_Cluster__c LIMIT 2000\n```';
+
+        List<Map<String, String>> queries = SoqlSanitizer.extractAllSoql(input);
+        System.assertEquals(2, queries.size(), 'Should extract 2 queries');
+        System.assert(queries[0].get('label').contains('Won deals'), 'First label should mention won deals: ' + queries[0].get('label'));
+        System.assert(queries[1].get('label').contains('consumed'), 'Second label should mention consumed: ' + queries[1].get('label'));
+        System.assert(queries[0].get('soql').contains('SELECT'), 'First query should be valid SOQL');
+        System.assert(queries[1].get('soql').contains('SELECT'), 'Second query should be valid SOQL');
+    }
+
+    @isTest
+    static void testExtractAllSoql_SingleBlock() {
+        String input = '```soql\nSELECT Id, Name FROM Account LIMIT 10\n```';
+        List<Map<String, String>> queries = SoqlSanitizer.extractAllSoql(input);
+        System.assertEquals(1, queries.size(), 'Should extract 1 query for backward compatibility');
+        System.assert(queries[0].get('soql').contains('Account'), 'Should contain Account query');
+    }
+
+    @isTest
+    static void testExtractAllSoql_MaxCap() {
+        // Build 7 queries - should cap at 5
+        String input = '';
+        for (Integer i = 1; i <= 7; i++) {
+            input += '-- Query ' + i + ': Test\n```soql\nSELECT Id FROM Account LIMIT 10\n```\n\n';
+        }
+        List<Map<String, String>> queries = SoqlSanitizer.extractAllSoql(input);
+        System.assert(queries.size() <= 5, 'Should cap at 5 queries, got: ' + queries.size());
+    }
+
+    @isTest
+    static void testExtractAllSoql_NoSoql() {
+        try {
+            SoqlSanitizer.extractAllSoql('I cannot generate queries for that.');
+            System.assert(false, 'Should throw for no SOQL');
+        } catch (SoqlSanitizer.SoqlValidationException e) {
+            System.assert(e.getMessage().contains('Could not find'), 'Should indicate no SOQL found');
+        }
+    }
+
+    @isTest
+    static void testExtractAllSoql_RawSelectFallback() {
+        String input = 'SELECT Id, Name FROM Account WHERE Industry = \'Tech\' LIMIT 10';
+        List<Map<String, String>> queries = SoqlSanitizer.extractAllSoql(input);
+        System.assertEquals(1, queries.size(), 'Should extract 1 query via raw SELECT fallback');
+    }
+
+    @isTest
+    static void testIsAllowedObject_NewObjects() {
+        System.assert(SoqlSanitizer.isAllowedObject('SELECT Id FROM Target__c'), 'Target__c should be allowed');
+        System.assert(SoqlSanitizer.isAllowedObject('SELECT Id FROM SDF__c'), 'SDF__c should be allowed');
+        System.assert(SoqlSanitizer.isAllowedObject('SELECT Id FROM Survey__c'), 'Survey__c should be allowed');
+        System.assert(SoqlSanitizer.isAllowedObject('SELECT Id FROM Daily_Task__c'), 'Daily_Task__c should be allowed');
+    }
+
+    @isTest
+    static void testIsAllowedObject_TableauObjects() {
+        System.assert(SoqlSanitizer.isAllowedObject('SELECT Id FROM Booking_Target__c LIMIT 10'), 'Booking_Target__c should be allowed');
+        System.assert(SoqlSanitizer.isAllowedObject('SELECT Id FROM Accounts_Target__c LIMIT 10'), 'Accounts_Target__c should be allowed');
+        System.assert(SoqlSanitizer.isAllowedObject('SELECT Id FROM Program__c LIMIT 10'), 'Program__c should be allowed');
+        System.assert(SoqlSanitizer.isAllowedObject('SELECT Id FROM Opp_Related_Programs__c LIMIT 10'), 'Opp_Related_Programs__c should be allowed');
+    }
+
     @isTest
     static void testFixFieldAliases_RelationshipWithRole() {
         String input = 'SELECT Id, Account.Name acctName, Owner.Name ownerName, Owner.UserRole.Name roleName FROM Opportunity LIMIT 10';

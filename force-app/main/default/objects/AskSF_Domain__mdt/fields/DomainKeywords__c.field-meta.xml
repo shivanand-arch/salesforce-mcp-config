@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>DomainKeywords__c</fullName>
+    <label>Domain Keywords</label>
+    <description>CSV of keywords for future domain classification (Phase 4 planner)</description>
+    <type>LongTextArea</type>
+    <length>2000</length>
+    <visibleLines>3</visibleLines>
+    <required>false</required>
+</CustomField>

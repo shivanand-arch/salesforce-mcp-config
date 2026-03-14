@@ -19,4 +19,12 @@
         <field>Max_Tokens__c</field>
         <value xsi:type="xsd:double">65536</value>
     </values>
+    <values>
+        <field>SF_Client_Id__c</field>
+        <value xsi:type="xsd:string">PlatformCLI</value>
+    </values>
+    <values>
+        <field>SF_Refresh_Token__c</field>
+        <value xsi:type="xsd:string">SET_VIA_METADATA_API__DO_NOT_COMMIT</value>
+    </values>
 </CustomMetadata>

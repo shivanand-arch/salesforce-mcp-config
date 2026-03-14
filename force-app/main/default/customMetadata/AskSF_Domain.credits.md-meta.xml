@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomMetadata xmlns="http://soap.sforce.com/2006/04/metadata"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <label>Account Credits</label>
+    <protected>false</protected>
+    <values>
+        <field>SourceType__c</field>
+        <value xsi:type="xsd:string">EXTERNAL</value>
+    </values>
+    <values>
+        <field>Queryable__c</field>
+        <value xsi:type="xsd:boolean">false</value>
+    </values>
+    <values>
+        <field>Parity__c</field>
+        <value xsi:type="xsd:string">NOT_SUPPORTED</value>
+    </values>
+    <values>
+        <field>ResponseMode__c</field>
+        <value xsi:type="xsd:string">EXPLAIN_ONLY</value>
+    </values>
+    <values>
+        <field>SortOrder__c</field>
+        <value xsi:type="xsd:double">100</value>
+    </values>
+    <values>
+        <field>UserMessageTemplate__c</field>
+        <value xsi:type="xsd:string">Account Credits data lives in AWS QuickSight, not in Salesforce. This information is not available through Ask SF. Please check the Account Credits tab on the Management Dashboard directly.</value>
+    </values>
+    <values>
+        <field>DomainKeywords__c</field>
+        <value xsi:type="xsd:string">credits,account credits,credit limit,billing</value>
+    </values>
+</CustomMetadata>

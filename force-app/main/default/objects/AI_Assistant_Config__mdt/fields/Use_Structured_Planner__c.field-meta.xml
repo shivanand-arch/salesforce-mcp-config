@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Use_Structured_Planner__c</fullName>
+    <label>Use Structured Planner</label>
+    <type>Checkbox</type>
+    <defaultValue>false</defaultValue>
+    <description>When true, revenue-domain questions use the structured planner path instead of the full SOQL prompt. Feature flag for incremental rollout.</description>
+</CustomField>

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomMetadata xmlns="http://soap.sforce.com/2006/04/metadata"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <label>Support Tickets</label>
+    <protected>false</protected>
+    <values>
+        <field>SourceType__c</field>
+        <value xsi:type="xsd:string">LIVE_SF</value>
+    </values>
+    <values>
+        <field>Queryable__c</field>
+        <value xsi:type="xsd:boolean">true</value>
+    </values>
+    <values>
+        <field>Parity__c</field>
+        <value xsi:type="xsd:string">EXACT</value>
+    </values>
+    <values>
+        <field>PrimaryObject__c</field>
+        <value xsi:type="xsd:string">Case</value>
+    </values>
+    <values>
+        <field>PrimaryDateField__c</field>
+        <value xsi:type="xsd:string">CreatedDate</value>
+    </values>
+    <values>
+        <field>DefaultTimegrain__c</field>
+        <value xsi:type="xsd:string">WEEK</value>
+    </values>
+    <values>
+        <field>ResponseMode__c</field>
+        <value xsi:type="xsd:string">DATA</value>
+    </values>
+    <values>
+        <field>SortOrder__c</field>
+        <value xsi:type="xsd:double">40</value>
+    </values>
+    <values>
+        <field>AllowedMeasures__c</field>
+        <value xsi:type="xsd:string">Age_in_min__c,Resolution_Time_Minutes__c,Customer_pending_hours__c</value>
+    </values>
+    <values>
+        <field>AllowedDimensions__c</field>
+        <value xsi:type="xsd:string">Status,Priority,RecordType.Name,Queue__c,Issue_Category__c,Product_Type__c,Product_SKU__c,Account.Name,Owner.Name</value>
+    </values>
+    <values>
+        <field>DomainKeywords__c</field>
+        <value xsi:type="xsd:string">tickets,cases,support,Ameyo Care,ECC,MTTR,SLA,escalation</value>
+    </values>
+</CustomMetadata>

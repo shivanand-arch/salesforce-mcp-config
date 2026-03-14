@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>MappingKey__c</fullName>
+    <label>Mapping Key</label>
+    <description>Key into static resource mapping dictionary for domain-specific field translations</description>
+    <type>Text</type>
+    <length>100</length>
+    <required>false</required>
+</CustomField>

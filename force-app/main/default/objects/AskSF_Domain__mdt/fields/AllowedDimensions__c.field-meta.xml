@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>AllowedDimensions__c</fullName>
+    <label>Allowed Dimensions</label>
+    <description>CSV list of groupable/filterable field API names for this domain</description>
+    <type>LongTextArea</type>
+    <length>10000</length>
+    <visibleLines>5</visibleLines>
+    <required>false</required>
+</CustomField>

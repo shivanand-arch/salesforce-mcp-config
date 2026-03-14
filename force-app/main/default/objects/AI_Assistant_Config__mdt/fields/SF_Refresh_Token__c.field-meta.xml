@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>SF_Refresh_Token__c</fullName>
+    <label>SF Refresh Token</label>
+    <type>Text</type>
+    <length>255</length>
+    <required>false</required>
+    <description>OAuth refresh token for self-org REST API queries (bypasses 50K governor limit)</description>
+</CustomField>

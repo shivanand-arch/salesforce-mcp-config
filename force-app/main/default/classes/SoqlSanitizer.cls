@@ -9,6 +9,16 @@ public class SoqlSanitizer {
     private static final Integer MAX_LIMIT = 2000;
     private static final Integer DEFAULT_LIMIT = 200;
 
+    // Objects with >50K rows — queries MUST have date filters to avoid governor limits
+    // System.LimitException (Too many query rows: 50001) is UNCATCHABLE — must be prevented
+    private static final Map<String, String> LARGE_OBJECT_DATE_FIELDS = new Map<String, String>{
+        'accounts_revenue__c' => 'Revenue_Booked_On__c',
+        'opportunity_trend__c' => 'Trend_Date__c',
+        'case' => 'CreatedDate',
+        'event' => 'CreatedDate',
+        'task' => 'CreatedDate'
+    };
+
     // Allowlisted objects that can be queried
     private static final Set<String> ALLOWED_OBJECTS = new Set<String>{
         'opportunity', 'account', 'lead', 'case', 'contact',
@@ -178,6 +188,7 @@ public class SoqlSanitizer {
         trimmed = fixFieldAliases(trimmed);
         trimmed = fixDuplicateAliases(trimmed);
         trimmed = fixDateTimeFormats(trimmed);
+        trimmed = enforceLargeObjectSafety(trimmed);
         trimmed = enforceLimit(trimmed);
 
         // Validate GROUP BY fields are groupable (prevents uncatchable System.UnexpectedException)
@@ -202,6 +213,21 @@ public class SoqlSanitizer {
         Matcher fromMatcher = fromPattern.matcher(soqlQuery);
         if (fromMatcher.find()) {
             return fromMatcher.group(1);
+        }
+        return null;
+    }
+
+    /**
+     * Extracts just the WHERE clause text from a SOQL query.
+     * Returns the text between WHERE and the next GROUP BY/ORDER BY/LIMIT/HAVING (or end of string).
+     * Returns null if no WHERE clause found.
+     */
+    @TestVisible
+    private static String extractWhereClause(String soqlQuery) {
+        Pattern wherePattern = Pattern.compile('(?i)\\bWHERE\\b(.+?)(?=\\s+GROUP\\s+BY|\\s+ORDER\\s+BY|\\s+LIMIT\\s+|\\s+HAVING\\s+|$)');
+        Matcher whereMatcher = wherePattern.matcher(soqlQuery);
+        if (whereMatcher.find()) {
+            return whereMatcher.group(1).trim();
         }
         return null;
     }
@@ -418,6 +444,90 @@ public class SoqlSanitizer {
                 }
             }
         }
+    }
+
+    /**
+     * Prevents uncatchable System.LimitException on large objects (>50K rows).
+     * In Salesforce, ALL rows matching WHERE are processed — even for GROUP BY queries.
+     * If >50,000 rows are scanned, the transaction is terminated with no way to catch it.
+     *
+     * Fix: Inject a date filter when queries on large objects lack one.
+     * Also forces non-aggregate queries on large objects to have a tight LIMIT.
+     */
+    private static String enforceLargeObjectSafety(String soqlQuery) {
+        String objectName = extractObjectName(soqlQuery);
+        if (objectName == null) return soqlQuery;
+
+        String objLower = objectName.toLowerCase();
+        if (!LARGE_OBJECT_DATE_FIELDS.containsKey(objLower)) return soqlQuery;
+
+        String dateField = LARGE_OBJECT_DATE_FIELDS.get(objLower);
+        String upper = soqlQuery.toUpperCase();
+        // Use word-boundary match — Claude often puts newlines before WHERE, not spaces
+        Boolean hasWhere = Pattern.compile('(?i)\\bWHERE\\b').matcher(soqlQuery).find();
+
+        // Check if the query already has a date filter IN THE WHERE CLAUSE ONLY.
+        // Must not match date fields that appear in SELECT or GROUP BY — only WHERE.
+        Boolean hasDateFilter = false;
+        if (hasWhere) {
+            // Extract the WHERE clause text (between WHERE and the next GROUP BY/ORDER BY/LIMIT/HAVING/end)
+            String whereClause = extractWhereClause(soqlQuery);
+            if (whereClause != null) {
+                String whereUpper = whereClause.toUpperCase();
+                String dateFieldUpper = dateField.toUpperCase();
+                hasDateFilter = whereUpper.contains(dateFieldUpper)
+                    || whereUpper.contains('LAST_N_DAYS')
+                    || whereUpper.contains('LAST_N_MONTHS')
+                    || whereUpper.contains('LAST_N_QUARTERS')
+                    || whereUpper.contains('LAST_N_YEARS')
+                    || whereUpper.contains('THIS_YEAR')
+                    || whereUpper.contains('LAST_YEAR')
+                    || whereUpper.contains('THIS_QUARTER')
+                    || whereUpper.contains('THIS_MONTH');
+            }
+        }
+
+        if (hasDateFilter) return soqlQuery;
+
+        // No date filter on a large object — inject a 2-year lookback
+        // This keeps row scans under 50K for objects growing ~2K records/month
+        Date twoYearsAgo = Date.today().addYears(-2);
+        String dateStr = String.valueOf(twoYearsAgo); // YYYY-MM-DD format
+        // DateTime fields (CreatedDate etc.) need T00:00:00Z suffix
+        Boolean isDateTimeField = dateField.equals('CreatedDate') || dateField.equals('LastModifiedDate');
+        if (isDateTimeField) {
+            dateStr = dateStr + 'T00:00:00Z';
+        }
+
+        if (hasWhere) {
+            // Append date filter to existing WHERE clause
+            // Find the end of WHERE clause (before GROUP BY, ORDER BY, LIMIT, HAVING)
+            // Use regex to insert before the first post-WHERE keyword
+            Pattern postWherePattern = Pattern.compile('(?i)\\s+(GROUP\\s+BY|ORDER\\s+BY|LIMIT\\s+|HAVING\\s+)');
+            Matcher postWhereMatcher = postWherePattern.matcher(soqlQuery);
+            if (postWhereMatcher.find()) {
+                Integer insertPos = postWhereMatcher.start();
+                soqlQuery = soqlQuery.substring(0, insertPos) +
+                    ' AND ' + dateField + ' >= ' + dateStr +
+                    soqlQuery.substring(insertPos);
+            } else {
+                soqlQuery = soqlQuery + ' AND ' + dateField + ' >= ' + dateStr;
+            }
+        } else {
+            // No WHERE clause — insert one before GROUP BY, ORDER BY, LIMIT, or at end
+            Pattern postFromPattern = Pattern.compile('(?i)\\s+(GROUP\\s+BY|ORDER\\s+BY|LIMIT\\s+|HAVING\\s+)');
+            Matcher postFromMatcher = postFromPattern.matcher(soqlQuery);
+            if (postFromMatcher.find()) {
+                Integer insertPos = postFromMatcher.start();
+                soqlQuery = soqlQuery.substring(0, insertPos) +
+                    ' WHERE ' + dateField + ' >= ' + dateStr +
+                    soqlQuery.substring(insertPos);
+            } else {
+                soqlQuery = soqlQuery + ' WHERE ' + dateField + ' >= ' + dateStr;
+            }
+        }
+
+        return soqlQuery;
     }
 
     /**

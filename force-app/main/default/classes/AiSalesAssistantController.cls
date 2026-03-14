@@ -16,6 +16,435 @@ public with sharing class AiSalesAssistantController {
     // Batch ID for stress test logging — set by StressTestRunner before calling askQuestion
     public static String currentBatchId;
 
+    // Domain capability override for tests (same pattern as ClaudeApiService.testConfig)
+    @TestVisible
+    private static AskSF_Domain__mdt testDomainOverride;
+
+    /**
+     * Resolves the domain capability record for a given Salesforce object.
+     * Uses AskSF_Domain__mdt custom metadata — queries are free (no SOQL limit cost).
+     * Returns null if no domain is registered for this object.
+     */
+    @TestVisible
+    private static AskSF_Domain__mdt resolveDomain(String objectName) {
+        if (testDomainOverride != null) return testDomainOverride;
+        if (String.isBlank(objectName)) return null;
+        List<AskSF_Domain__mdt> domains = [
+            SELECT DeveloperName, SourceType__c, Queryable__c, Parity__c,
+                   PrimaryObject__c, ResponseMode__c, UserMessageTemplate__c,
+                   AllowedMeasures__c, AllowedDimensions__c
+            FROM AskSF_Domain__mdt
+            WHERE PrimaryObject__c = :objectName
+            ORDER BY SortOrder__c ASC NULLS LAST
+            LIMIT 1
+        ];
+        return domains.isEmpty() ? null : domains[0];
+    }
+
+    // ── Structured Planner (revenue-only, behind feature flag) ──────────
+
+    private static final String PLANNER_SYSTEM_PROMPT =
+        'You are a query planner for Exotel/Ameyo\'s Salesforce org.\n' +
+        'Your job is to convert a natural-language question into a structured JSON query plan.\n' +
+        'Return ONLY valid JSON — no markdown, no explanation.\n\n' +
+        '<domain_context>\n' +
+        'Object: accounts_revenue__c\n' +
+        'Primary date field: Revenue_Booked_On__c (Date type, format YYYY-MM-DD)\n' +
+        'Allowed measures: Revenue_Booked_Amount__c, GP__c, Variable_Cost__c, Fixed_Cost__c, Total_Cost__c, Norm_Rev_Amount__c\n' +
+        'Allowed dimensions: Cluster__c, Region__c, SKU__c, Parent_SKU__c, Product_Type__c, Classification__c, Revenue_Classification__c, Currency__c, Account__r.Name, Account_Manager__c, CSM__c\n' +
+        'Parent_SKU__c values: Voice, Contact Centre, SMS, Whatsapp, Truecaller, Gen AI\n' +
+        'SKU__c values: PF Voice, PF Others, PF Messaging SMS, Enterprise CC, PF Messaging Whatsapp, PF Voice CC, PF Others TC, Conversational AI, Voice Streaming, Chatbot, CQA, Voicebot, PF Messaging Others, PF Messaging RCS, VSIP\n' +
+        'Cluster__c values: Africa, APAC, Banking and Insurance, BFSI & Strategic Large, Financial Services, FM Funded-I, FM Funded-II & Traditional-II, Internal, KSA, Marketplace, Mid Market, Mobility, Partnerships, Retail, Romena, Services, SMB, SME Funded, Technology, Traditional-I, UAE, US\n' +
+        'Region__c values: International, Scaleup, Domestic Enterprise\n' +
+        'Revenue_Classification__c: Recurring, Non-Recurring\n' +
+        'Classification__c: New Sales, Cross sell, Up sell, AMC Renewal\n' +
+        'Currency__c values: INR, USD, AED\n' +
+        '</domain_context>\n\n' +
+        '<fiscal_rules>\n' +
+        'Indian FY runs Apr-Mar. FY2025 = Apr 2025 - Mar 2026.\n' +
+        'Q1=Apr-Jun, Q2=Jul-Sep, Q3=Oct-Dec, Q4=Jan-Mar.\n' +
+        '"This year"/"current year" = current Indian FY (Apr 1 to today).\n' +
+        'No date specified = current FY (Apr 1 to today).\n' +
+        '</fiscal_rules>\n\n' +
+        '<instructions>\n' +
+        'Analyze the question and return a JSON plan.\n' +
+        'If the question is NOT about revenue/GP/cost/margin from accounts_revenue__c, return:\n' +
+        '{"domain":"not_revenue","reason":"brief explanation"}\n\n' +
+        'For revenue questions, return:\n' +
+        '{"domain":"revenue","intent":"aggregate|detail|ranking","object":"accounts_revenue__c",' +
+        '"measures":[{"fn":"SUM","field":"...","alias":"..."}],' +
+        '"dimensions":["Cluster__c"],' +
+        '"filters":[{"field":"...","op":"=|!=|>|>=|<|<=|IN|NOT IN|BETWEEN","value":"..."}],' +
+        '"dateFilter":{"field":"Revenue_Booked_On__c","start":"YYYY-MM-DD","end":"YYYY-MM-DD"},' +
+        '"sort":{"field":"alias_or_dimension","direction":"ASC|DESC"},' +
+        '"limit":2000}\n\n' +
+        'Rules:\n' +
+        '- ALWAYS include dateFilter with explicit start/end dates.\n' +
+        '- For "top N" questions: set intent=ranking, limit=2000 (summary truncates), sort DESC on measure alias.\n' +
+        '- For customer rankings: use Account__r.Name dimension and add filter {"field":"Account__c","op":"!=","value":null}.\n' +
+        '- Include Currency__c dimension when data spans multiple currencies.\n' +
+        '- Use BETWEEN op only in dateFilter; use IN op for picklist multi-value filters.\n' +
+        '- detail intent is NOT allowed for accounts_revenue__c (too many rows). Use aggregate or ranking.\n' +
+        '</instructions>\n\n' +
+        '<examples>\n' +
+        'Q: "Total revenue this year"\n' +
+        '{"domain":"revenue","intent":"aggregate","object":"accounts_revenue__c",' +
+        '"measures":[{"fn":"SUM","field":"Revenue_Booked_Amount__c","alias":"rev"}],' +
+        '"dimensions":["Cluster__c","Currency__c"],' +
+        '"filters":[],' +
+        '"dateFilter":{"field":"Revenue_Booked_On__c","start":"2025-04-01","end":"2026-03-14"},' +
+        '"sort":{"field":"rev","direction":"DESC"},"limit":2000}\n\n' +
+        'Q: "Top customers by GP in Q3"\n' +
+        '{"domain":"revenue","intent":"ranking","object":"accounts_revenue__c",' +
+        '"measures":[{"fn":"SUM","field":"GP__c","alias":"gp"}],' +
+        '"dimensions":["Account__r.Name","SKU__c","Cluster__c","Currency__c"],' +
+        '"filters":[{"field":"Account__c","op":"!=","value":null}],' +
+        '"dateFilter":{"field":"Revenue_Booked_On__c","start":"2025-10-01","end":"2025-12-31"},' +
+        '"sort":{"field":"gp","direction":"DESC"},"limit":2000}\n\n' +
+        'Q: "How many bookings this quarter?"\n' +
+        '{"domain":"not_revenue","reason":"Bookings use Opportunity object, not accounts_revenue__c"}\n' +
+        '</examples>';
+
+    // Allowed operators for plan filters
+    private static final Set<String> ALLOWED_OPS = new Set<String>{
+        '=', '!=', '>', '>=', '<', '<=', 'IN', 'NOT IN'
+    };
+
+    // Allowed aggregate functions
+    private static final Set<String> ALLOWED_FNS = new Set<String>{
+        'SUM', 'COUNT', 'AVG', 'MIN', 'MAX'
+    };
+
+    /**
+     * Checks whether the structured planner feature flag is enabled.
+     * Reads Use_Structured_Planner__c from AI_Assistant_Config__mdt.Claude_API.
+     */
+    @TestVisible
+    private static Boolean testPlannerFlag;
+
+    @TestVisible
+    private static Boolean isStructuredPlannerEnabled() {
+        if (testPlannerFlag != null) return testPlannerFlag;
+        try {
+            AI_Assistant_Config__mdt config = AI_Assistant_Config__mdt.getInstance('Claude_API');
+            return config != null && config.Use_Structured_Planner__c == true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Validates a revenue query plan against domain allowlists.
+     * Returns null if valid, or an error message string if invalid.
+     */
+    @TestVisible
+    private static String validateRevenuePlan(Map<String, Object> plan, AskSF_Domain__mdt domain) {
+        // Must be revenue domain
+        String planDomain = (String) plan.get('domain');
+        if (planDomain != 'revenue') {
+            return 'Plan domain is not revenue: ' + planDomain;
+        }
+
+        // Object must be accounts_revenue__c
+        String obj = (String) plan.get('object');
+        if (obj != 'accounts_revenue__c') {
+            return 'Invalid object: ' + obj;
+        }
+
+        // Intent must not be detail (governor limit risk)
+        String intent = (String) plan.get('intent');
+        if (intent == 'detail') {
+            return 'Detail intent not allowed on accounts_revenue__c';
+        }
+
+        // Build allowlists from domain metadata
+        Set<String> allowedMeasures = new Set<String>();
+        if (String.isNotBlank(domain.AllowedMeasures__c)) {
+            for (String m : domain.AllowedMeasures__c.split(',')) {
+                allowedMeasures.add(m.trim().toLowerCase());
+            }
+        }
+        Set<String> allowedDimensions = new Set<String>();
+        if (String.isNotBlank(domain.AllowedDimensions__c)) {
+            for (String d : domain.AllowedDimensions__c.split(',')) {
+                allowedDimensions.add(d.trim().toLowerCase());
+            }
+        }
+
+        // Validate measures
+        List<Object> measures = (List<Object>) plan.get('measures');
+        if (measures == null || measures.isEmpty()) {
+            return 'No measures specified';
+        }
+        for (Object mObj : measures) {
+            Map<String, Object> m = (Map<String, Object>) mObj;
+            String fn = ((String) m.get('fn')).toUpperCase();
+            String field = (String) m.get('field');
+            if (!ALLOWED_FNS.contains(fn)) {
+                return 'Invalid aggregate function: ' + fn;
+            }
+            // COUNT(Id) is always allowed
+            if (fn == 'COUNT' && field != null && field.toLowerCase() == 'id') {
+                continue;
+            }
+            if (!allowedMeasures.contains(field.toLowerCase())) {
+                return 'Field not in allowed measures: ' + field;
+            }
+        }
+
+        // Validate dimensions
+        List<Object> dimensions = (List<Object>) plan.get('dimensions');
+        if (dimensions != null) {
+            for (Object dObj : dimensions) {
+                String dim = (String) dObj;
+                if (!allowedDimensions.contains(dim.toLowerCase())) {
+                    return 'Field not in allowed dimensions: ' + dim;
+                }
+            }
+        }
+
+        // Validate filters
+        List<Object> filters = (List<Object>) plan.get('filters');
+        if (filters != null) {
+            // Build combined allowlist: measures + dimensions + date field + Account__c (for null check)
+            Set<String> allowedFilterFields = new Set<String>();
+            allowedFilterFields.addAll(allowedMeasures);
+            allowedFilterFields.addAll(allowedDimensions);
+            allowedFilterFields.add('revenue_booked_on__c');
+            allowedFilterFields.add('account__c');
+
+            for (Object fObj : filters) {
+                Map<String, Object> f = (Map<String, Object>) fObj;
+                String field = (String) f.get('field');
+                String op = ((String) f.get('op')).toUpperCase();
+                if (!allowedFilterFields.contains(field.toLowerCase())) {
+                    return 'Filter field not allowed: ' + field;
+                }
+                if (!ALLOWED_OPS.contains(op)) {
+                    return 'Invalid operator: ' + op;
+                }
+            }
+        }
+
+        // Validate dateFilter
+        Map<String, Object> dateFilter = (Map<String, Object>) plan.get('dateFilter');
+        if (dateFilter == null) {
+            return 'dateFilter is required for revenue queries';
+        }
+        String dateField = (String) dateFilter.get('field');
+        if (dateField != 'Revenue_Booked_On__c') {
+            return 'Invalid date field: ' + dateField;
+        }
+
+        // Validate limit
+        Object limitObj = plan.get('limit');
+        if (limitObj != null) {
+            Integer lim = limitObj instanceof Integer ? (Integer) limitObj : Integer.valueOf(String.valueOf(limitObj));
+            if (lim > 2000) {
+                return 'Limit exceeds maximum (2000): ' + lim;
+            }
+        }
+
+        return null; // valid
+    }
+
+    /**
+     * Compiles a validated revenue plan into a SOQL query string.
+     */
+    @TestVisible
+    private static String compileSoqlFromPlan(Map<String, Object> plan) {
+        List<Object> measures = (List<Object>) plan.get('measures');
+        List<Object> dimensions = (List<Object>) plan.get('dimensions');
+        List<Object> filters = (List<Object>) plan.get('filters');
+        Map<String, Object> dateFilter = (Map<String, Object>) plan.get('dateFilter');
+        Map<String, Object> sortSpec = (Map<String, Object>) plan.get('sort');
+        Object limitObj = plan.get('limit');
+
+        // SELECT clause
+        List<String> selectParts = new List<String>();
+        // Add dimensions first
+        if (dimensions != null) {
+            for (Object dObj : dimensions) {
+                selectParts.add((String) dObj);
+            }
+        }
+        // Add measures
+        Map<String, String> aliasToExpr = new Map<String, String>();
+        for (Object mObj : measures) {
+            Map<String, Object> m = (Map<String, Object>) mObj;
+            String fn = ((String) m.get('fn')).toUpperCase();
+            String field = (String) m.get('field');
+            String alias = (String) m.get('alias');
+            String expr = fn + '(' + field + ')';
+            selectParts.add(expr + (String.isNotBlank(alias) ? ' ' + alias : ''));
+            if (String.isNotBlank(alias)) {
+                aliasToExpr.put(alias, expr);
+            }
+        }
+
+        String soql = 'SELECT ' + String.join(selectParts, ', ');
+        soql += ' FROM accounts_revenue__c';
+
+        // WHERE clause
+        List<String> whereParts = new List<String>();
+
+        // Date filter (always present after validation)
+        String startDate = (String) dateFilter.get('start');
+        String endDate = (String) dateFilter.get('end');
+        whereParts.add('Revenue_Booked_On__c >= ' + startDate);
+        whereParts.add('Revenue_Booked_On__c <= ' + endDate);
+
+        // Additional filters
+        if (filters != null) {
+            for (Object fObj : filters) {
+                Map<String, Object> f = (Map<String, Object>) fObj;
+                String field = (String) f.get('field');
+                String op = ((String) f.get('op')).toUpperCase();
+                Object value = f.get('value');
+
+                if (op == 'IN' || op == 'NOT IN') {
+                    List<Object> vals = (List<Object>) value;
+                    List<String> quoted = new List<String>();
+                    for (Object v : vals) {
+                        quoted.add('\'' + String.escapeSingleQuotes(String.valueOf(v)) + '\'');
+                    }
+                    whereParts.add(field + ' ' + op + ' (' + String.join(quoted, ', ') + ')');
+                } else if (value == null) {
+                    // null comparisons
+                    if (op == '!=') {
+                        whereParts.add(field + ' != null');
+                    } else {
+                        whereParts.add(field + ' = null');
+                    }
+                } else {
+                    // Numeric vs string value
+                    String strVal = String.valueOf(value);
+                    Boolean isNumeric = strVal.isNumeric() || (strVal.contains('.') && strVal.replaceFirst('\\.', '').isNumeric());
+                    if (isNumeric) {
+                        whereParts.add(field + ' ' + op + ' ' + strVal);
+                    } else {
+                        whereParts.add(field + ' ' + op + ' \'' + String.escapeSingleQuotes(strVal) + '\'');
+                    }
+                }
+            }
+        }
+
+        soql += ' WHERE ' + String.join(whereParts, ' AND ');
+
+        // GROUP BY (all dimensions)
+        if (dimensions != null && !dimensions.isEmpty()) {
+            List<String> groupByParts = new List<String>();
+            for (Object dObj : dimensions) {
+                groupByParts.add((String) dObj);
+            }
+            soql += ' GROUP BY ' + String.join(groupByParts, ', ');
+        }
+
+        // ORDER BY
+        if (sortSpec != null) {
+            String sortField = (String) sortSpec.get('field');
+            String sortDir = (String) sortSpec.get('direction');
+            if (String.isNotBlank(sortField)) {
+                // If the sort field is an alias, use the aggregate expression
+                String orderExpr = aliasToExpr.containsKey(sortField) ? aliasToExpr.get(sortField) : sortField;
+                soql += ' ORDER BY ' + orderExpr + (sortDir == 'ASC' ? ' ASC' : ' DESC');
+            }
+        }
+
+        // LIMIT
+        if (limitObj != null) {
+            Integer lim = limitObj instanceof Integer ? (Integer) limitObj : Integer.valueOf(String.valueOf(limitObj));
+            soql += ' LIMIT ' + lim;
+        }
+
+        return soql;
+    }
+
+    /**
+     * 3-state result from the structured planner.
+     * SUCCESS: compiled SOQL queries ready for execution
+     * NOT_REVENUE: planner classified this as a non-revenue question (classification result, not error)
+     * ERROR: planner failed (parse error, validation error, API issue) — safe to fall back
+     */
+    @TestVisible
+    private class PlannerResult {
+        String status;     // 'SUCCESS', 'NOT_REVENUE', 'ERROR'
+        List<Map<String, String>> queries;
+        String reason;     // for NOT_REVENUE: why; for ERROR: what failed
+        String targetDomain; // for NOT_REVENUE: where it should go (e.g., 'bookings', 'pipeline')
+
+        PlannerResult(String status) {
+            this.status = status;
+        }
+    }
+
+    /**
+     * Runs the structured planner path for revenue questions.
+     * Returns a 3-state PlannerResult:
+     *   SUCCESS → compiled SOQL queries, skip the legacy prompt
+     *   NOT_REVENUE → classification result (not an error), check if domain is blocked
+     *   ERROR → planner failure, safe to fall back to legacy prompt
+     */
+    @TestVisible
+    private static PlannerResult runRevenuePlanner(String enrichedQuestion, AskSF_Domain__mdt domain) {
+        try {
+            // Call Claude with the small planner prompt
+            ClaudeApiService.ClaudeResponse planResponse =
+                ClaudeApiService.sendMessage(PLANNER_SYSTEM_PROMPT, enrichedQuestion, 2048);
+
+            // Parse JSON plan
+            String planJson = planResponse.content.trim();
+            // Strip markdown code fences if present
+            if (planJson.startsWith('```')) {
+                planJson = planJson.substringAfter('\n');
+                if (planJson.contains('```')) {
+                    planJson = planJson.substringBefore('```');
+                }
+                planJson = planJson.trim();
+            }
+
+            Map<String, Object> plan = (Map<String, Object>) JSON.deserializeUntyped(planJson);
+
+            // If planner says not_revenue, return classification result (NOT a fallback)
+            String planDomain = (String) plan.get('domain');
+            if (planDomain == 'not_revenue') {
+                PlannerResult pr = new PlannerResult('NOT_REVENUE');
+                pr.reason = (String) plan.get('reason');
+                System.debug('Planner classified as not_revenue: ' + pr.reason);
+                return pr;
+            }
+
+            // Validate the plan
+            String validationError = validateRevenuePlan(plan, domain);
+            if (validationError != null) {
+                System.debug('Planner validation failed: ' + validationError);
+                PlannerResult pr = new PlannerResult('ERROR');
+                pr.reason = validationError;
+                return pr;
+            }
+
+            // Compile to SOQL
+            String soql = compileSoqlFromPlan(plan);
+
+            // Return as single-query list (same format as extractAllSoql output)
+            PlannerResult pr = new PlannerResult('SUCCESS');
+            pr.queries = new List<Map<String, String>>();
+            pr.queries.add(new Map<String, String>{
+                'label' => 'Revenue Query (Structured Planner)',
+                'soql' => soql
+            });
+            return pr;
+
+        } catch (Exception e) {
+            System.debug('Planner error, falling back: ' + e.getMessage());
+            PlannerResult pr = new PlannerResult('ERROR');
+            pr.reason = e.getMessage();
+            return pr;
+        }
+    }
+
+    // ── End Structured Planner ──────────────────────────────────────────
+
     private static final String SOQL_SYSTEM_PROMPT =
         'You are a Salesforce SOQL generator for Exotel/Ameyo\'s org. Convert natural language to SOQL.\n\n' +
         '=== RULES ===\n' +
@@ -55,8 +484,11 @@ public with sharing class AiSalesAssistantController {
         '    GROUP BY Account_Cluster__c, StageName ORDER BY Account_Cluster__c LIMIT 2000\n' +
         '  The summary step will then: won = rows where StageName=Order, total = all rows per cluster → win rate = won/total.\n' +
         'PIPELINE: "pipeline"/"funnel"/"open deals"/"active opportunities"\n' +
-        '  Pipeline = all currently OPEN deals. Use explicit active stage list:\n' +
-        '    StageName IN (\'Suspect\',\'Approach\',\'Prospect\',\'Proposal\',\'Negotiation\',\'POC\',\'On Hold\',\'Closed won - Pending\')\n' +
+        '  Pipeline/Funnel = all currently OPEN deals (CRM Buddy definition — excludes Suspect):\n' +
+        '    StageName IN (\'Approach\',\'Prospect\',\'Proposal\',\'Negotiation\',\'SDF Submission\',\'POC\',\'On Hold\',\'Closed won - Pending\')\n' +
+        '  NOTE: Suspect is NOT pipeline — it is pre-qualification. Only include Suspect if user explicitly asks for "suspects" or "all stages".\n' +
+        '  TOTAL FUNNEL: Pipeline + Booking + Closed stages combined (all non-Suspect stages).\n' +
+        '    "total funnel"/"full funnel" → ALL stages EXCEPT Suspect.\n' +
         '  NEVER use IsClosed = false (it incorrectly includes Closed Lost, SDF Rejected etc. because SF IsClosed flag is inconsistent).\n' +
         '  VALUE FIELD: Use Normalize_Amount_INR__c (formula, already INR-normalized — matches Tableau dashboard).\n' +
         '    Normalize_Amount_INR__c CAN be used in SUM() with GROUP BY. It just cannot be in the GROUP BY clause itself.\n' +
@@ -67,7 +499,7 @@ public with sharing class AiSalesAssistantController {
         '    "This year pipeline" = all currently open deals (NOT filtered by CreatedDate or CloseDate).\n' +
         '  Group by: StageName, Account_Cluster__c, Account_Region__c, Forecast_Category__c, Owner.Name, SKU__c\n' +
         '  Example: SELECT Account_Cluster__c, StageName, COUNT(Id) cnt, SUM(Normalize_Amount_INR__c) pipelineValue\n' +
-        '    FROM Opportunity WHERE StageName IN (\'Suspect\',\'Approach\',\'Prospect\',\'Proposal\',\'Negotiation\',\'POC\',\'On Hold\')\n' +
+        '    FROM Opportunity WHERE StageName IN (\'Approach\',\'Prospect\',\'Proposal\',\'Negotiation\',\'SDF Submission\',\'POC\',\'On Hold\')\n' +
         '    GROUP BY Account_Cluster__c, StageName ORDER BY SUM(Normalize_Amount_INR__c) DESC LIMIT 2000\n' +
         '  OPPORTUNITY ANALYSIS (Tableau "Accepted" view): Uses ISQL_Accepted_Date__c for date filter across ALL stages.\n' +
         '    If user references "opportunity analysis" or "accepted pipeline", filter by ISQL_Accepted_Date__c, not StageName.\n\n' +
@@ -126,11 +558,48 @@ public with sharing class AiSalesAssistantController {
         '  Only add CurrencyIsoCode to SELECT for deal-level detail views.\n' +
         '  Only GROUP BY CurrencyIsoCode when user EXPLICITLY asks to split by currency.\n' +
         'Amount/Net_New__c are in NATIVE currency — only use for single-currency queries.\n' +
-        'Conversion rates (if manual calc needed): 1 USD=83.33 INR, 1 AED=22.73 INR.\n\n' +
+        'Conversion rates vary by context:\n' +
+        '  Tableau Booking dashboard: 1 USD=85 INR, 1 AED=22 INR\n' +
+        '  Tableau Revenue dashboard (Actual): 1 USD=80 INR\n' +
+        '  Tableau Revenue dashboard (Normalized): 1 USD=75 INR\n' +
+        '  For Ask SF summary display: use 1 USD=83 INR, 1 AED=23 INR as working average.\n\n' +
         '=== REVENUE DEFINITION (TWO SOURCES) ===\n' +
         '** SOURCE 1 - REPORTED REVENUE (DEFAULT for "revenue" questions): **\n' +
         '  Object: accounts_revenue__c\n' +
         '  Value Field: Revenue_Booked_Amount__c (Label: Reported Rev Amount)\n' +
+        '  ⚠️ GOVERNOR LIMIT (CRITICAL): ~8,000 records/month, 100K+/year. Apex limit = 50K rows/transaction.\n' +
+        '    RULE: Apex AUTO-SPLITS queries spanning >6 months into H1/H2 chunks.\n' +
+        '    You can write a SINGLE full-year query — Apex handles the split automatically.\n' +
+        '    Example for "revenue this year" (FY2026 = Apr 2025 - Mar 2026):\n' +
+        '    ```soql\n' +
+        '    SELECT Cluster__c, SUM(Revenue_Booked_Amount__c) rev\n' +
+        '    FROM accounts_revenue__c\n' +
+        '    WHERE Revenue_Booked_On__c >= 2025-04-01 AND Revenue_Booked_On__c <= 2026-03-31\n' +
+        '    GROUP BY Cluster__c\n' +
+        '    ```\n' +
+        '    Apex auto-splits this into H1 (Apr-Sep) + H2 (Oct-Mar) and merges results.\n' +
+        '    ALWAYS use GROUP BY with SUM/COUNT aggregates.\n' +
+        '    NEVER write detail-level SELECT — it WILL crash.\n' +
+        '    ⚠️ THIS RULE APPLIES TO ALL VALUE FIELDS: Revenue_Booked_Amount__c, GP__c, Variable_Cost__c, Fixed_Cost__c, Total_Cost__c.\n' +
+        '  CURRENCY NOTE: Revenue_Booked_Amount__c AND GP__c are in NATIVE currency (INR for domestic, USD for intl).\n' +
+        '    Tableau converts USD×80 for "Actual" view. For cross-region totals, ALWAYS include Currency__c in SELECT\n' +
+        '    and let the summary step apply conversion (1 USD=83 INR, 1 AED=23 INR).\n' +
+        '  CUSTOMER RANKING: For "top customers" queries, use Account__r.Name (NOT Customer_Name__c).\n' +
+        '    ⚠️ CRITICAL: Customer_Name__c is NULL for many records (especially recent months). ALWAYS use Account__r.Name.\n' +
+        '    GROUP BY Account__r.Name AND SKU__c — Tableau breaks rankings by Account Name × SKU.\n' +
+        '    Add "Account__c != null" in WHERE to exclude orphan records.\n' +
+        '    Also include Cluster__c, Currency__c in SELECT for context.\n' +
+        '    NOTE: You can generate a SINGLE full-year query — Apex auto-splits into H1/H2 chunks.\n' +
+        '    Example — "top 10 customers by GP":\n' +
+        '    ```soql\n' +
+        '    SELECT Account__r.Name acctName, SKU__c, Cluster__c, Currency__c, SUM(GP__c) gp\n' +
+        '    FROM accounts_revenue__c\n' +
+        '    WHERE Revenue_Booked_On__c >= 2025-04-01 AND Revenue_Booked_On__c <= 2026-03-31\n' +
+        '    AND Account__c != null\n' +
+        '    GROUP BY Account__r.Name, SKU__c, Cluster__c, Currency__c\n' +
+        '    ORDER BY SUM(GP__c) DESC LIMIT 2000\n' +
+        '    ```\n' +
+        '    Apex auto-splits this into H1 (Apr-Sep) + H2 (Oct-Mar). Summary merges by Account__r.Name×SKU__c.\n' +
         '  Date Field: Revenue_Booked_On__c\n' +
         '  Cluster/Sector: Cluster__c (directly on this object)\n' +
         '  Other fields: SKU__c, Products__c, Region__c, Classification__c,\n' +
@@ -139,13 +608,37 @@ public with sharing class AiSalesAssistantController {
         '    Product_Type__c, AOP_Category__c, Revenue_Attribution__c,\n' +
         '    Variable_Cost__c, Fixed_Cost__c, Total_Cost__c, GP__c,\n' +
         '    Parent_SKU__c, Rev_Source__c, Rev_Sub_Source__c, Currency__c\n' +
+        '  Parent_SKU__c VALUES (use EXACT match, NEVER LIKE): Voice, Contact Centre, SMS, Whatsapp, Truecaller, Gen AI\n' +
+        '    "voice revenue" → Parent_SKU__c = \'Voice\' (NOT LIKE — LIKE catches Voice Streaming, Voicebot etc.)\n' +
+        '    "CC revenue"/"contact centre" → Parent_SKU__c = \'Contact Centre\'\n' +
+        '    "SMS revenue"/"messaging" → Parent_SKU__c = \'SMS\'\n' +
+        '    "WhatsApp revenue" → Parent_SKU__c = \'Whatsapp\'\n' +
+        '    "AI revenue"/"gen AI" → Parent_SKU__c = \'Gen AI\'\n' +
+        '  SKU__c VALUES (finer grain): PF Voice, PF Others, PF Messaging SMS, Enterprise CC,\n' +
+        '    PF Messaging Whatsapp, PF Voice CC, PF Others TC, Conversational AI,\n' +
+        '    Voice Streaming, Chatbot, CQA, Voicebot, PF Messaging Others, PF Messaging RCS, VSIP\n' +
+        '    Use SKU__c for detailed product breakdown, Parent_SKU__c for broad category.\n' +
+        '  IMPORTANT: For product filtering, ALWAYS use = (exact match) on Parent_SKU__c.\n' +
+        '    NEVER use LIKE with wildcards for SKU/Parent_SKU — values are exact picklist entries.\n' +
         '  Formula fields (NO GROUP BY): Account_Region__c, Universal_Acc_Cluster__c,\n' +
         '    Universal_Acc_AM__c, Account_Geography__c, Total_Rev_break_Amount__c\n\n' +
         '** SOURCE 2 - ORDER BOOKINGS (for "bookings", "deals won", "order value"): **\n' +
         '  Object: Opportunity\n' +
         '  Stage Filter: StageName IN (\'Order\',\'POC\')\n' +
         '  Date Field: B_Deal_Date__c (NOT CloseDate)\n' +
-        '  Value Field: Net_New_INR__c (formula, already in INR)\n\n' +
+        '  Value Field: Net_New_INR__c (formula, already in INR)\n' +
+        '  DEDUP FIELD: Opportunity_Line_Item_Count__c — count of OpportunityLineItems per Opp.\n' +
+        '    17% of won deals have multiple line items, inflating raw SUM by ~22%.\n' +
+        '    ALWAYS include Opportunity_Line_Item_Count__c in SELECT for booking queries.\n' +
+        '    The summary step will divide each deal\'s value by its line item count before summing.\n' +
+        '  REVERSAL FILTER: Exclude Net_New_INR__c < 0 deals (reversals) from booking totals.\n' +
+        '    Add: AND Net_New_INR__c >= 0 to all booking aggregation queries.\n' +
+        '    37 reversal deals in FY25 = -1.1 Cr that Tableau excludes.\n' +
+        '  TABLEAU MATCHING: To match Tableau dashboard values:\n' +
+        '    1. Include Opportunity_Line_Item_Count__c in SELECT (cannot GROUP BY — it\'s a formula)\n' +
+        '    2. Add AND Net_New_INR__c >= 0 to exclude reversals\n' +
+        '    3. Summary step: for each deal, use Net_New_INR__c / Opportunity_Line_Item_Count__c\n' +
+        '    4. Remaining ~5% gap is due to currency rate differences (Tableau uses USD=85, SF formula varies)\n\n' +
         'DEFAULT: Use accounts_revenue__c for revenue questions unless user\n' +
         '  specifically asks about deals/bookings/pipeline/opportunities.\n' +
         'SECTOR queries: Use Cluster__c on accounts_revenue__c, or Account_Cluster__c on Opportunity.\n\n' +
@@ -155,7 +648,8 @@ public with sharing class AiSalesAssistantController {
         '  ForecastCategoryName, LastStageChangeDate(DateTime!), LastActivityDate, NextStep,\n' +
         '  CampaignId, CurrencyIsoCode, HasOpportunityLineItem, RecordTypeId\n\n' +
         'Custom Number: MRR_Amount__c(MRR,NUMBER not Currency,88% filled), One_Time_Value__c(100% filled),\n' +
-        '  Net_New__c, Full_Potential_Value__c(39% filled — use with caution)\n' +
+        '  Net_New__c, Full_Potential_Value__c(39% filled — use with caution),\n' +
+        '  Opportunity_Line_Item_Count__c(rollup count of line items — INCLUDE in booking queries for dedup)\n' +
         'UNRELIABLE Opp fields (<5% fill — NEVER use for ranking/aggregation):\n' +
         '  Committed_Booking_Value__c(5%), Channels_Count__c(3%), DID_Count__c(3%),\n' +
         '  Number_of_seats__c(0%), Seats_Count__c(does not exist on Opp)\n' +
@@ -181,12 +675,16 @@ public with sharing class AiSalesAssistantController {
         'Lookup: Product_Specialist__c(User/Pre-Sales), Co_owner__c(User/CSM), Lead__c(Lead),\n' +
         '  Lead_Created_By__c(User), Owner_Manager__c(User)\n' +
         'Formula(read-only,NO GROUP BY): Net_New_INR__c(Net New INR - ONLY for WON deals/bookings, ZERO for pipeline/lost),\n' +
+        '  Opportunity_Line_Item_Count__c(line item count — use for dedup in summary, NOT in GROUP BY),\n' +
         '  Amount_INR__c, Amount_USD__c, Norm_MRR__c, Total_Amount__c,\n' +
         '  Sales_Cycle__c, Business_Unit__c, Cluster__c, Region__c, Stage_Name__c,\n' +
         '  Source_Type__c, Age__c, Last_Activity_Since__c\n\n' +
-        'STAGE VALUES: Active: Approach, Suspect, Prospect, Proposal, Negotiation, POC, On Hold,\n' +
-        '  Closed won - Pending. Won: "Order" (NOT "Closed Won").\n' +
-        '  Lost: Closed Lost, Closed-No decision, Closed Unknown, Closed Duplicate, Rejected, SDF Rejected\n' +
+        'STAGE VALUES & GROUPINGS (aligned with CRM Buddy definitions):\n' +
+        '  Pre-qualification: Suspect (NOT pipeline — pre-qualification only).\n' +
+        '  Pipeline/Funnel (active): Approach, Prospect, Proposal, Negotiation, SDF Submission, POC, On Hold, Closed won - Pending.\n' +
+        '  Booking/Won: Order (NOT "Closed Won"). POC also maps to Booking stage in CRM Buddy.\n' +
+        '  Lost: Closed Lost, Closed-No decision, Closed Unknown, Closed Duplicate, Rejected, SDF Rejected, POC Closed.\n' +
+        '  Total Funnel: Pipeline + Booking + Lost — everything except Suspect.\n' +
         'RecordTypes: Amendment Type, CPQ Existing Customer Type, CPQ New Customer Type,\n' +
         '  Existing Customer Type, New Customer Type, New Prospect, Renewal Type\n\n' +
         'SALES REP RANKINGS: When ranking "sales reps" or "top performers", ALWAYS exclude non-sales roles:\n' +
@@ -196,8 +694,10 @@ public with sharing class AiSalesAssistantController {
         '  CX/CSM roles (CX_, CSM) are Customer Success — include ONLY if user asks about CX/CSM performance.\n\n' +
         '=== CASE (557 fields) — Support Tickets ===\n' +
         'NATURAL LANGUAGE → QUERY MAPPING (users may say ANY of these):\n' +
-        '  "Ameyo Care"/"ECC tickets"/"contact center tickets"/"Ameyo tickets"/"CC tickets"/"enterprise CC"\n' +
+        '  "Ameyo Care"/"ECC tickets"/"contact center tickets"/"Ameyo tickets"/"CC tickets"\n' +
         '    → RecordType.Name IN (\'Normal Support\',\'Change Management\',\'RCA\',\'Release Upgrade\')\n' +
+        '  DISAMBIGUATION: "ECC revenue"/"ECC bookings" → Opportunity/accounts_revenue__c with Parent_SKU__c=\'Contact Centre\' (NOT Case).\n' +
+        '    "ECC tickets"/"ECC support" → Case object. Context determines which object to query.\n' +
         '  "Platform tickets"/"voice tickets"/"Exotel tickets"/"exolite"/"platform issues"\n' +
         '    → RecordType.Name = \'Platform Support\'\n' +
         '  "AI tickets"/"Cogno tickets"/"chatbot tickets"/"bot issues"/"Cogno AI"/"conversational AI tickets"\n' +
@@ -454,11 +954,14 @@ public with sharing class AiSalesAssistantController {
         '  Variants: Monthly, Rolling 3M, Rolling 12M, YTD.\n' +
         '  Also NRGP/GRGP = same formulas using GP__c instead of Revenue_Booked_Amount__c.\n' +
         '  Keyholes: Region__c, Cluster__c, Parent_SKU__c, SKU__c, AD/CSM.\n\n' +
-        'GP MARGIN — from Tableau Revenue Dashboard (accounts_revenue__c):\n' +
-        '  GP__c / Revenue_Booked_Amount__c from accounts_revenue__c.\n' +
+        'GP / GROSS PROFIT — from Tableau Revenue Dashboard (accounts_revenue__c):\n' +
+        '  ⚠️ SAME GOVERNOR LIMIT AS REVENUE. GP queries on accounts_revenue__c MUST split H1/H2.\n' +
+        '  GP value: GP__c. GP margin: GP__c / Revenue_Booked_Amount__c.\n' +
         '  Cost fields: Variable_Cost__c, Fixed_Cost__c, Total_Cost__c.\n' +
         '  Filter by: Parent_SKU__c, SKU__c, Cluster__c, Region__c, AOP_Category__c.\n' +
-        '  GPR (Gross Profit Retention): Same as NRR/GRR but using GP__c instead of Revenue.\n\n' +
+        '  "Top customers by GP" → GROUP BY Account__r.Name, SKU__c (Tableau shows Account × SKU rankings).\n' +
+        '  GPR (Gross Profit Retention): Same as NRR/GRR but using GP__c instead of Revenue.\n' +
+        '  GP__c is in NATIVE currency — include Currency__c in SELECT for cross-region totals.\n\n' +
         'PENETRATION INDEX — from Tableau Penetration Index dashboard:\n' +
         '  Uses Account + accounts_revenue__c + Opportunity_Trend__c.\n' +
         '  ACI = Account Coverage Index (accounts with any revenue in period).\n' +
@@ -494,6 +997,64 @@ public with sharing class AiSalesAssistantController {
         '  WARNING: Uses Tableau Prep flow (OB_to_Revenue__c) — NOT directly queryable via SOQL.\n' +
         '  For OB→Rev questions, use separate queries on Opportunity (OB) and accounts_revenue__c (Rev)\n' +
         '  then let the summary step combine them.\n\n' +
+        '=== SLANG & ABBREVIATION DICTIONARY (CRM Buddy single source of truth) ===\n' +
+        'Users often use short names/slang. Map these to EXACT Salesforce picklist values:\n\n' +
+        'STAGE SLANG:\n' +
+        '  "pipeline"/"funnel"/"open deals" → StageName IN (\'Approach\',\'Prospect\',\'Proposal\',\'Negotiation\',\'SDF Submission\',\'POC\',\'On Hold\',\'Closed won - Pending\')\n' +
+        '  "total funnel"/"full funnel" → ALL stages except Suspect\n' +
+        '  "booking"/"won"/"order" → StageName IN (\'Order\',\'POC\')\n' +
+        '  "lost"/"losses" → StageName IN (\'Closed Lost\',\'Closed-No decision\',\'Closed Unknown\',\'Closed Duplicate\',\'Rejected\',\'SDF Rejected\',\'POC Closed\')\n' +
+        '  "suspects" → StageName = \'Suspect\' (pre-qualification, NOT part of pipeline)\n' +
+        '  "SDF"/"SDF stage" → StageName = \'SDF Submission\'\n' +
+        '  "POC closed" → StageName = \'POC Closed\' (treated as a loss stage)\n\n' +
+        'REGION ABBREVIATIONS (Account_Region__c on Opportunity, Region__c on accounts_revenue__c):\n' +
+        '  "Dom"/"Domestic" → \'Domestic Enterprise\'\n' +
+        '  "Int"/"Intl"/"International" → \'International\'\n' +
+        '  "Scale"/"Scaleup" → \'Scaleup\'\n' +
+        '  "Americas"/"US" → \'Americas\'\n\n' +
+        'CLUSTER ABBREVIATIONS (Account_Cluster__c on Opportunity, Cluster__c on accounts_revenue__c):\n' +
+        '  "BI"/"BFSI" → \'Banking and Insurance\'\n' +
+        '  "FS" → \'Financial Services\'\n' +
+        '  "Tech" → \'Technology\'\n' +
+        '  "MM"/"Mid-Market" → \'Mid Market\'\n' +
+        '  "SMB" → \'SMB\'\n' +
+        '  "SME" → \'SME\' (note: distinct from SMB)\n' +
+        '  "DNa"/"Digital Natives" → Technology or Services cluster (context-dependent)\n' +
+        '  "ME"/"Middle East" → \'UAE\' or \'KSA\' (ask for specifics, or query both)\n' +
+        '  "ROW" → \'APAC\' or other international clusters\n\n' +
+        'PARENT_SKU / PRODUCT SLANG (Parent_SKU__c on accounts_revenue__c — ALWAYS exact match, never LIKE):\n' +
+        '  "ECC"/"Enterprise CC"/"Contact Centre"/"CC revenue" → Parent_SKU__c = \'Contact Centre\'\n' +
+        '    IMPORTANT: "ECC" means Contact Centre product, NOT support tickets. For support tickets use Case object.\n' +
+        '  "Voice"/"PF Voice" → Parent_SKU__c = \'Voice\'\n' +
+        '  "SMS"/"Messaging" → Parent_SKU__c = \'SMS\'\n' +
+        '  "WA"/"WhatsApp" → Parent_SKU__c = \'Whatsapp\'\n' +
+        '  "TC"/"Truecaller" → Parent_SKU__c = \'Truecaller\'\n' +
+        '  "AI"/"Gen AI"/"GenAI" → Parent_SKU__c = \'Gen AI\'\n\n' +
+        'DEAL TYPE ABBREVIATIONS (Deal_Type__c on Opportunity):\n' +
+        '  "Subs"/"Sub"/"Subscription" → Deal_Type__c = \'Subscription\'\n' +
+        '  "OT"/"One Time"/"Onetime" → Deal_Type__c = \'Onetime_Customisation\'\n' +
+        '  "OP"/"On-Premise"/"On Prem" → Deal_Type__c = \'On-Premise\'\n' +
+        '  "AMC" → Deal_Type__c = \'AMC\'\n\n' +
+        'CLASSIFICATION ABBREVIATIONS (Classification_Type__c on Opportunity):\n' +
+        '  "New Sales"/"NS" → Classification_Type__c = \'New Sales\'\n' +
+        '  "Cross sell"/"XS"/"CS" → Classification_Type__c = \'Cross sell\'\n' +
+        '  "Up sell"/"US" → Classification_Type__c = \'Up sell\'\n' +
+        '  "Renewal"/"AMC Renewal" → Classification_Type__c = \'AMC Renewal\'\n' +
+        '  "Net New Upsell" → Classification_Type__c IN (\'Net-New Upsell (Cross-Sell)\',\'Net-New Upsell (New Sales)\')\n\n' +
+        'COMMIT / FORECAST SLANG:\n' +
+        '  "commit deals"/"committed" → Commit_Status__c = \'Commit Deal\'\n' +
+        '  "non-commit"/"uncommitted" → Commit_Status__c = \'Non-Commit Deal\'\n' +
+        '  "voice commit deals" → Commit_Status__c = \'Commit Deal\' AND SKU__c LIKE \'%Voice%\' (composite filter)\n' +
+        '  "forecast commit" → Forecast_Category__c = \'Commit\'\n' +
+        '  "forecast upside" → Forecast_Category__c = \'Upside\'\n\n' +
+        'REVERSAL SLANG:\n' +
+        '  "reversals"/"reversed deals" → Reversal_Type__c != null (any reversal)\n' +
+        '  "full reversal" → Reversal_Type__c = \'Full Reversal\'\n' +
+        '  "partial reversal" → Reversal_Type__c = \'Partial Reversal\'\n' +
+        '  For booking queries, EXCLUDE reversals by default: AND Net_New_INR__c >= 0\n\n' +
+        'DEAL CATEGORY (Deal_Category__c on Opportunity):\n' +
+        '  "Hunting"/"hunter" → Deal_Category__c = \'Hunting\'\n' +
+        '  "Farming"/"farmer" → Deal_Category__c = \'Farming\'\n\n' +
         '=== SOQL GOTCHAS ===\n' +
         '1. Multi-picklist: INCLUDES/EXCLUDES infix only. WRONG: INCLUDES(field,val). WRONG: NOT INCLUDES.\n' +
         '2. No alias in ORDER BY. WRONG: ORDER BY total. RIGHT: ORDER BY COUNT(Id) DESC.\n' +
@@ -533,7 +1094,7 @@ public with sharing class AiSalesAssistantController {
         '  - This gives the summary step data for top/bottom contributor analysis.\n' +
         'Example: "What is total pipeline?" →\n' +
         '  SELECT Account_Cluster__c, StageName, COUNT(Id) cnt, SUM(Amount) val\n' +
-        '  FROM Opportunity WHERE StageName IN (\'Suspect\',\'Approach\',\'Prospect\',\'Proposal\',\'Negotiation\',\'POC\',\'On Hold\')\n' +
+        '  FROM Opportunity WHERE StageName IN (\'Approach\',\'Prospect\',\'Proposal\',\'Negotiation\',\'SDF Submission\',\'POC\',\'On Hold\')\n' +
         '  GROUP BY Account_Cluster__c, StageName ORDER BY SUM(Amount) DESC LIMIT 2000\n' +
         'The only exception: COUNT() queries for a single precise number ("how many open cases?") may return one row.';
 
@@ -553,7 +1114,14 @@ public with sharing class AiSalesAssistantController {
         'rankings in ₹ across ALL regions (Domestic + International). Do NOT split by currency. ' +
         'When data uses Amount or Net_New__c with CurrencyIsoCode, show Indian deals in ₹ and ' +
         'International deals in $ but ALWAYS include an INR-equivalent total for unified comparison ' +
-        '(1 USD=83.33 INR, 1 AED=22.73 INR). Never omit international reps from leaderboards.\n\n' +
+        '(1 USD=83 INR, 1 AED=23 INR). Never omit international reps from leaderboards.\n\n' +
+        'BOOKING DEDUP: When data includes Opportunity_Line_Item_Count__c:\n' +
+        '  For each deal, compute ADJUSTED value = Net_New_INR__c / Opportunity_Line_Item_Count__c.\n' +
+        '  Use ADJUSTED values for all booking totals and rankings.\n' +
+        '  This matches how the Tableau dashboard deduplicates multi-product deals.\n' +
+        '  If Opportunity_Line_Item_Count__c is null or 0, treat as 1 (no dedup needed).\n' +
+        '  Show both "Raw Total" and "Adjusted Total (deduped)" when presenting booking summaries.\n' +
+        '  The adjusted total will be ~20% lower than raw — this is correct and matches the dashboard.\n\n' +
         'QUARTER DEFINITIONS: Q1=Apr-Jun, Q2=Jul-Sep, Q3=Oct-Dec, Q4=Jan-Mar. FY runs April to March.\n\n' +
         'SDR PERFORMANCE: Rank SDRs by downstream won Opportunity revenue (via Lead_Created_By__c),\n' +
         '  NOT by MRR_Amount__c on Lead (which has <10% fill rate). Show: deals won, total revenue,\n' +
@@ -568,6 +1136,12 @@ public with sharing class AiSalesAssistantController {
         '  - Present BOTH value and count win rates — they tell different stories.\n' +
         '  - Note: Net_New_INR__c is only populated for won deals. For win rate denominator, Amount is correct.\n' +
         '  - Rank dimensions (clusters, owners, etc.) by win rate and highlight best/worst performers.\n\n' +
+        'TOTALS ACCURACY: When computing grand totals from query results:\n' +
+        '  - ALWAYS sum ALL rows in the result set, not just the ones shown in the table.\n' +
+        '  - If you abbreviate the table (show top 10 of 24 rows), the TOTAL must still include ALL 24 rows.\n' +
+        '  - For H1+H2 splits: compute each half\'s total by summing ALL rows in that query, then add both halves.\n' +
+        '  - Show the total first, THEN the breakdown. Never compute the total from the abbreviated table.\n' +
+        '  - Cross-check: the grand total should equal the sum of every individual row. If it doesn\'t, recount.\n\n' +
         'MULTI-QUERY RESULTS: When you receive labeled result sets from multiple queries:\n' +
         '  - Join datasets by matching dimensions (cluster, owner, region, etc.).\n' +
         '  - Compute the requested metric: Win Rate = Won/Total × 100, Growth = (Current-Previous)/Previous × 100.\n' +
@@ -575,7 +1149,17 @@ public with sharing class AiSalesAssistantController {
         '  - Show underlying numbers alongside computed percentages.\n' +
         '  - Rank by the computed metric, highlight top/bottom performers.\n' +
         '  - If a dimension appears in one query but not the other, flag it (e.g., "No won deals in this cluster").\n' +
-        '  - For cross-object queries (e.g., Opportunity + accounts_revenue__c), explain how the datasets relate.\n\n' +
+        '  - For cross-object queries (e.g., Opportunity + accounts_revenue__c), explain how the datasets relate.\n' +
+        '  H1/H2 MERGE FOR RANKINGS: When queries are split by time period (H1=Apr-Sep, H2=Oct-Mar):\n' +
+        '    - MUST merge H1+H2 data by matching dimension keys (Account__r.Name×SKU__c, or Cluster__c, etc.).\n' +
+        '    - Sum values across periods BEFORE ranking. A customer in both H1 and H2 gets their totals added.\n' +
+        '    - A customer appearing only in H1 or only in H2 still counts — use their single-period value.\n' +
+        '    - NEVER rank based on just one half. The final ranking MUST reflect the full year.\n' +
+        '    - If one half is missing/truncated, EXPLICITLY warn that rankings are partial.\n' +
+        '  CURRENCY IN RANKINGS: When data includes Currency__c (INR/USD/AED):\n' +
+        '    - Convert ALL values to INR before ranking (1 USD=83 INR, 1 AED=23 INR).\n' +
+        '    - Show converted ₹ values in the ranking table.\n' +
+        '    - Note the conversion rate used.\n\n' +
         'CURRENCY DISPLAY: Format ALL monetary values in Indian Lakhs: ₹X.XX L (divide by 100,000).\n' +
         '  Example: 2142000 → ₹21.42 L. 50000000 → ₹500.00 L. For values above ₹100 L, you may use Cr (₹X.XX Cr = divide by 10,000,000).\n' +
         '  Be consistent within one response — pick Lakhs or Crores based on the magnitude of the largest value.\n\n' +
@@ -664,12 +1248,73 @@ public with sharing class AiSalesAssistantController {
                     '\n\n[Current question]\n' + enrichedQuestion;
             }
 
-            // Step 1: Generate SOQL via Claude
-            ClaudeApiService.ClaudeResponse soqlResponse =
-                ClaudeApiService.sendMessage(SOQL_SYSTEM_PROMPT, enrichedQuestion, 8192);
+            // Step 0: Try structured planner path (revenue-only, behind feature flag)
+            List<Map<String, String>> queries = null;
+            Boolean usedPlanner = false;
 
-            // Step 2: Extract ALL SOQL queries (supports 1-5 labeled queries)
-            List<Map<String, String>> queries = SoqlSanitizer.extractAllSoql(soqlResponse.content);
+            if (isStructuredPlannerEnabled()) {
+                // Resolve revenue domain to get allowlists for validation
+                AskSF_Domain__mdt revDomain = resolveDomain('accounts_revenue__c');
+                if (revDomain != null) {
+                    PlannerResult planResult = runRevenuePlanner(enrichedQuestion, revDomain);
+
+                    if (planResult.status == 'SUCCESS') {
+                        // Planner compiled SOQL — use it, skip the legacy prompt
+                        queries = planResult.queries;
+                        usedPlanner = true;
+
+                    } else if (planResult.status == 'NOT_REVENUE') {
+                        // Classification result: this question is not about revenue.
+                        // Check if the target domain is blocked before falling through.
+                        // The planner's reason often hints at the actual domain (bookings, credits, etc.)
+                        String reason = planResult.reason != null ? planResult.reason.toLowerCase() : '';
+
+                        // Check all registered non-queryable domains
+                        // If the reason mentions a blocked domain's keywords, block it here
+                        List<AskSF_Domain__mdt> blockedDomains = [
+                            SELECT DeveloperName, DomainKeywords__c, UserMessageTemplate__c
+                            FROM AskSF_Domain__mdt
+                            WHERE Queryable__c = false
+                            ORDER BY SortOrder__c ASC NULLS LAST
+                        ];
+                        Boolean blocked = false;
+                        for (AskSF_Domain__mdt bd : blockedDomains) {
+                            if (String.isNotBlank(bd.DomainKeywords__c)) {
+                                for (String kw : bd.DomainKeywords__c.split(',')) {
+                                    if (reason.contains(kw.trim().toLowerCase()) ||
+                                        userQuestion.toLowerCase().contains(kw.trim().toLowerCase())) {
+                                        // Match — block this question
+                                        resp.success = true;
+                                        resp.answer = String.isNotBlank(bd.UserMessageTemplate__c)
+                                            ? bd.UserMessageTemplate__c
+                                            : 'This data is not available through Ask SF.';
+                                        resp.recordCount = 0;
+                                        resp.executionTimeMs = System.currentTimeMillis() - startTime;
+                                        logQuery(userQuestion, null, null, 0, true, null,
+                                                 'PLANNER_DOMAIN_BLOCKED', 0, resp.executionTimeMs);
+                                        return resp;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Not blocked — fall through to legacy SOQL prompt
+                        // (handles bookings, pipeline, cases, leads, etc.)
+                        System.debug('Planner: not_revenue, not blocked → falling through to SOQL prompt');
+                    }
+                    // else status == 'ERROR' → fall through to legacy SOQL prompt (safe fallback)
+                }
+            }
+
+            // Step 1: Fall back to full SOQL prompt if planner didn't handle it
+            if (queries == null) {
+                ClaudeApiService.ClaudeResponse soqlResponse =
+                    ClaudeApiService.sendMessage(SOQL_SYSTEM_PROMPT, enrichedQuestion, 8192);
+
+                // Step 2: Extract ALL SOQL queries (supports 1-5 labeled queries)
+                queries = SoqlSanitizer.extractAllSoql(soqlResponse.content);
+            }
+
             initialSoql = queries[0].get('soql');
 
             // Step 3: Validate all queries target allowed objects
@@ -679,6 +1324,33 @@ public with sharing class AiSalesAssistantController {
                 }
             }
 
+            // Step 3.1: Domain capability check
+            String primaryObject = SoqlSanitizer.extractObjectName(queries[0].get('soql'));
+            AskSF_Domain__mdt domain = resolveDomain(primaryObject);
+
+            if (domain != null && !domain.Queryable__c) {
+                resp.success = true;
+                resp.answer = String.isNotBlank(domain.UserMessageTemplate__c)
+                    ? domain.UserMessageTemplate__c
+                    : 'This data is not available through Ask SF (' + domain.SourceType__c + ' source).';
+                resp.soqlQuery = queries[0].get('soql');
+                resp.recordCount = 0;
+                resp.executionTimeMs = System.currentTimeMillis() - startTime;
+                logQuery(userQuestion, initialSoql, resp.soqlQuery, 0, true, null,
+                         'DOMAIN_NOT_QUERYABLE', 0, resp.executionTimeMs);
+                return resp;
+            }
+
+            String parityNote = null;
+            if (domain != null && domain.Parity__c == 'APPROXIMATE') {
+                parityNote = 'NOTE: This data domain (' + domain.DeveloperName +
+                    ') has APPROXIMATE parity with dashboards. Numbers may differ from Tableau.';
+            }
+
+            // Step 3.5: Auto-split large object queries that span >5 months
+            // This ensures H1/H2 split happens reliably even if Claude fails to split
+            queries = autoSplitLargeObjectQueries(queries);
+
             // Step 4: Execute each query with per-query self-correction retry
             List<Map<String, Object>> allResults = new List<Map<String, Object>>();
             Integer totalRecords = 0;
@@ -686,40 +1358,92 @@ public with sharing class AiSalesAssistantController {
 
             for (Map<String, String> q : queries) {
                 QueryResult qr = executeWithRetry(q.get('soql'), enrichedQuestion);
-                totalRecords += qr.records.size();
+                retryCount += qr.retries;
 
                 // Track the final (possibly corrected) SOQL
                 allSoqlQueries.add(qr.finalSoql);
 
-                allResults.add(new Map<String, Object>{
-                    'label' => q.get('label'),
-                    'soql' => qr.finalSoql,
-                    'records' => qr.records,
-                    'count' => qr.records.size()
-                });
+                // Handle both execution paths: Database.query() vs REST API callout
+                if (qr.restApiJson != null) {
+                    // REST API path — use actual fetched count, not totalSize
+                    Integer count = qr.restApiRecordCount != null ? qr.restApiRecordCount : 0;
+                    totalRecords += count;
+                    Map<String, Object> resultEntry = new Map<String, Object>{
+                        'label' => q.get('label'),
+                        'soql' => qr.finalSoql,
+                        'jsonResult' => qr.restApiJson,
+                        'count' => count
+                    };
+                    if (qr.restApiTruncated) {
+                        resultEntry.put('truncated', true);
+                        resultEntry.put('totalSize', qr.restApiTotalSize);
+                    }
+                    allResults.add(resultEntry);
+                } else {
+                    // Standard Database.query() path
+                    totalRecords += qr.records.size();
+                    allResults.add(new Map<String, Object>{
+                        'label' => q.get('label'),
+                        'soql' => qr.finalSoql,
+                        'records' => qr.records,
+                        'count' => qr.records.size()
+                    });
+                }
             }
 
             // Store all queries in response (joined by separator for display)
             resp.soqlQuery = String.join(allSoqlQueries, '\n---\n');
             resp.recordCount = totalRecords;
 
-            // Step 5: Build combined labeled results JSON (cap at 80KB total)
+            // Step 5: Build combined labeled results JSON
+            // Budget: divide available space equally across queries so all queries get included
+            Integer maxTotalChars = 80000;
+            Integer maxPerQuery = allResults.size() > 0 ? maxTotalChars / allResults.size() : maxTotalChars;
+
             String resultsJson = '';
             for (Map<String, Object> result : allResults) {
                 String label = (String) result.get('label');
                 String soql = (String) result.get('soql');
-                List<SObject> records = (List<SObject>) result.get('records');
                 Integer count = (Integer) result.get('count');
 
-                String sectionJson = JSON.serialize(records);
-                resultsJson += '=== ' + label + ' (' + count + ' records) ===\n';
-                resultsJson += 'SOQL: ' + soql + '\n';
-                resultsJson += sectionJson + '\n\n';
-
-                if (resultsJson.length() > 80000) {
-                    resultsJson += '... [TRUNCATED - total ' + totalRecords + ' records across ' + allResults.size() + ' queries]';
-                    break;
+                // Handle both execution paths
+                String sectionJson;
+                if (result.containsKey('jsonResult')) {
+                    // REST API path — already serialized
+                    sectionJson = (String) result.get('jsonResult');
+                } else {
+                    // Standard Database.query() path
+                    List<SObject> records = (List<SObject>) result.get('records');
+                    sectionJson = JSON.serialize(records);
                 }
+
+                // Compute aggregate totals BEFORE trimming (uses full dataset)
+                String computedTotals = computeAggregateTotals(result);
+
+                // If this section's JSON exceeds its budget, trim to top rows
+                // Keep top rows (already sorted by ORDER BY DESC from SOQL) + totals
+                Integer headerOverhead = 300; // label, SOQL, totals line
+                Integer jsonBudget = maxPerQuery - headerOverhead;
+                Integer originalRows = count;
+                if (sectionJson.length() > jsonBudget && jsonBudget > 1000) {
+                    sectionJson = trimJsonToFit(sectionJson, jsonBudget);
+                }
+
+                resultsJson += '=== ' + label + ' (' + count + ' records';
+                if (result.containsKey('truncated') && (Boolean) result.get('truncated')) {
+                    resultsJson += ' of ' + (Integer) result.get('totalSize') + ' total — TRUNCATED, analysis is partial';
+                }
+                if (sectionJson.length() < jsonBudget && originalRows > 100) {
+                    resultsJson += ', showing top rows — full totals in PRE-COMPUTED TOTALS below';
+                }
+                resultsJson += ') ===\n';
+                resultsJson += 'SOQL: ' + soql + '\n';
+                resultsJson += sectionJson + '\n';
+
+                if (String.isNotBlank(computedTotals)) {
+                    resultsJson += computedTotals;
+                }
+                resultsJson += '\n';
             }
 
             // Step 6: Summarize results via Claude
@@ -740,6 +1464,11 @@ public with sharing class AiSalesAssistantController {
                 'role' => 'assistant',
                 'content' => querySummary
             });
+            // Inject parity note for APPROXIMATE domains
+            if (String.isNotBlank(parityNote)) {
+                resultsJson = parityNote + '\n\n' + resultsJson;
+            }
+
             conversation.add(new Map<String, String>{
                 'role' => 'user',
                 'content' => 'Here are the results (' + totalRecords + ' total records across ' +
@@ -786,14 +1515,445 @@ public with sharing class AiSalesAssistantController {
 
     /**
      * Result wrapper for executeWithRetry — carries both the records and the final SOQL.
+     * Supports two execution paths: Database.query() (records) or REST API callout (restApiJson).
      */
     private class QueryResult {
         List<SObject> records;
         String finalSoql;
+        // REST API execution path — when set, records is null and this holds the JSON response
+        String restApiJson;
+        Integer restApiRecordCount;   // Actual number of records fetched (may be < totalSize if truncated)
+        Integer restApiTotalSize;     // Salesforce's reported totalSize (full result set)
+        Boolean restApiTruncated = false; // True if pagination cap hit before all pages fetched
+        // Number of self-correction retries attempted (for analytics logging)
+        Integer retries = 0;
+    }
+
+    // Salesforce governor limit is 50,000 rows per transaction.
+    // Database.countQuery() is free (1 row). Pre-check to avoid uncatchable System.LimitException.
+    private static final Integer ROW_SAFETY_LIMIT = 40000;
+
+    // Test-only flag: when true, forces REST API execution path regardless of row estimate.
+    @TestVisible private static Boolean forceRestApiExecution = false;
+
+    // Objects known to have >50K rows — if estimation fails, assume unsafe and route to REST
+    private static final Set<String> KNOWN_LARGE_OBJECTS = new Set<String>{
+        'accounts_revenue__c', 'opportunity', 'case', 'lead', 'event', 'task',
+        'opportunity_trend__c', 'saas_daily_usage__c'
+    };
+
+    /**
+     * Auto-splits queries on large objects (accounts_revenue__c) when the date range
+     * spans more than 5 months. Ensures reliable H1/H2 splitting even if Claude
+     * generates a single full-year query.
+     *
+     * For queries already split by Claude (each ≤6 months), passes them through unchanged.
+     * For unsplit queries spanning >5 months, creates H1 (Apr-Sep) and H2 (Oct-Mar) chunks.
+     */
+    @TestVisible
+    private static List<Map<String, String>> autoSplitLargeObjectQueries(List<Map<String, String>> queries) {
+        List<Map<String, String>> result = new List<Map<String, String>>();
+
+        for (Map<String, String> q : queries) {
+            String soql = q.get('soql');
+            String label = q.get('label');
+            String objectName = SoqlSanitizer.extractObjectName(soql);
+
+            if (objectName == null || objectName.toLowerCase() != 'accounts_revenue__c') {
+                result.add(q);
+                continue;
+            }
+
+            // Extract date range: Revenue_Booked_On__c >= YYYY-MM-DD AND Revenue_Booked_On__c <= YYYY-MM-DD
+            Pattern dateRangePattern = Pattern.compile(
+                '(?i)Revenue_Booked_On__c\\s*>=\\s*(\\d{4}-\\d{2}-\\d{2})\\s+AND\\s+Revenue_Booked_On__c\\s*<=\\s*(\\d{4}-\\d{2}-\\d{2})'
+            );
+            Matcher dateMatcher = dateRangePattern.matcher(soql);
+
+            if (!dateMatcher.find()) {
+                result.add(q); // No parseable date range, keep as-is
+                continue;
+            }
+
+            Date startDate = Date.valueOf(dateMatcher.group(1));
+            Date endDate = Date.valueOf(dateMatcher.group(2));
+            Integer monthSpan = startDate.monthsBetween(endDate);
+
+            if (monthSpan <= 6) {
+                result.add(q); // Already within safe range
+                continue;
+            }
+
+            // Split into 6-month chunks
+            System.debug('Auto-splitting ' + objectName + ' query spanning ' + monthSpan +
+                ' months: ' + dateMatcher.group(1) + ' to ' + dateMatcher.group(2));
+
+            // Capture the SOQL parts before and after the date range
+            String beforeDates = soql.substring(0, dateMatcher.start());
+            String afterDates = soql.substring(dateMatcher.end());
+
+            Date chunkStart = startDate;
+            Integer chunkIndex = 1;
+            while (chunkStart < endDate) {
+                Date chunkEnd = chunkStart.addMonths(6).addDays(-1);
+                if (chunkEnd > endDate) chunkEnd = endDate;
+
+                String chunkSoql = beforeDates +
+                    'Revenue_Booked_On__c >= ' + String.valueOf(chunkStart) +
+                    ' AND Revenue_Booked_On__c <= ' + String.valueOf(chunkEnd) +
+                    afterDates;
+
+                // Create descriptive label (H1, H2, etc.)
+                String halfLabel = chunkIndex == 1 ? 'H1' : 'H2';
+                String monthRange = String.valueOf(chunkStart).substring(0, 7) + ' to ' +
+                    String.valueOf(chunkEnd).substring(0, 7);
+                String chunkLabel = label + ' (' + halfLabel + ': ' + monthRange + ')';
+
+                result.add(new Map<String, String>{
+                    'label' => chunkLabel,
+                    'soql' => chunkSoql
+                });
+
+                System.debug('  Chunk ' + chunkIndex + ': ' + String.valueOf(chunkStart) + ' to ' + String.valueOf(chunkEnd));
+
+                chunkStart = chunkEnd.addDays(1);
+                chunkIndex++;
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Estimates how many source rows a SOQL query would scan.
+     * Computes aggregate totals from query results so Claude doesn't have to do arithmetic.
+     * For aggregate queries with SUM/COUNT, sums up all numeric fields and appends a
+     * PRE-COMPUTED TOTALS line that Claude can use directly in its summary.
+     */
+    // Known measure aliases/suffixes that should be summed in aggregate totals.
+    // Numeric dimension fields like Quarter__c, Year__c, month numbers must NOT be summed.
+    private static final Set<String> MEASURE_ALIASES = new Set<String>{
+        'rev', 'gp', 'cnt', 'amount', 'value', 'cost', 'total', 'sum', 'count',
+        'mrr', 'nrr', 'ob', 'target', 'variance', 'budget', 'net_new'
+    };
+    private static final Set<String> MEASURE_FIELD_SUFFIXES = new Set<String>{
+        'amount__c', 'rev__c', 'gp__c', 'cost__c', 'value__c', 'mrr__c',
+        'total__c', 'count__c', 'bvt__c', 'revenue__c'
+    };
+
+    @TestVisible
+    private static Boolean isMeasureField(String fieldKey) {
+        if (fieldKey == null) return false;
+        // exprN fields from AggregateResult are always measures (SUM, COUNT, AVG, etc.)
+        if (fieldKey.toLowerCase().startsWith('expr')) return true;
+        String lower = fieldKey.toLowerCase();
+        // Exact match on known aliases (e.g., 'rev', 'gp', 'cnt')
+        if (MEASURE_ALIASES.contains(lower)) return true;
+        // Suffix match on Salesforce field API names (e.g., Revenue_Booked_Amount__c)
+        for (String suffix : MEASURE_FIELD_SUFFIXES) {
+            if (lower.endsWith(suffix)) return true;
+        }
+        // Contains known measure keywords (handles aliases like 'total_gp', 'net_new_inr')
+        for (String alias : MEASURE_ALIASES) {
+            if (lower.contains(alias)) return true;
+        }
+        return false;
+    }
+
+    private static String computeAggregateTotals(Map<String, Object> queryResult) {
+        try {
+            // Parse the JSON result (works for both REST API and Database.query paths)
+            String jsonStr;
+            if (queryResult.containsKey('jsonResult')) {
+                jsonStr = (String) queryResult.get('jsonResult');
+            } else {
+                List<SObject> records = (List<SObject>) queryResult.get('records');
+                if (records == null || records.isEmpty()) return null;
+                jsonStr = JSON.serialize(records);
+            }
+
+            List<Object> rows = (List<Object>) JSON.deserializeUntyped(jsonStr);
+            if (rows == null || rows.size() < 2) return null; // No need for totals on single-row results
+
+            // Identify numeric MEASURE fields from first row — skip dimensions like Quarter, Year
+            Map<String, Object> firstRow = (Map<String, Object>) rows[0];
+            Map<String, Decimal> totals = new Map<String, Decimal>();
+            for (String key : firstRow.keySet()) {
+                if (key == 'attributes' || key == 'Id') continue;
+                Object val = firstRow.get(key);
+                if ((val instanceof Decimal || val instanceof Double || val instanceof Integer || val instanceof Long)
+                    && isMeasureField(key)) {
+                    totals.put(key, 0);
+                }
+            }
+
+            if (totals.isEmpty()) return null;
+
+            // Sum only measure fields across all rows
+            for (Object rowObj : rows) {
+                Map<String, Object> row = (Map<String, Object>) rowObj;
+                for (String key : totals.keySet()) {
+                    Object val = row.get(key);
+                    if (val != null) {
+                        Decimal current = totals.get(key);
+                        if (val instanceof Decimal) {
+                            totals.put(key, current + (Decimal) val);
+                        } else if (val instanceof Double) {
+                            totals.put(key, current + (Double) val);
+                        } else if (val instanceof Integer) {
+                            totals.put(key, current + (Integer) val);
+                        } else if (val instanceof Long) {
+                            totals.put(key, current + (Long) val);
+                        }
+                    }
+                }
+            }
+
+            // Format totals line
+            String result = 'PRE-COMPUTED TOTALS (use these exact values, do NOT recompute): ';
+            List<String> parts = new List<String>();
+            for (String key : totals.keySet()) {
+                parts.add(key + '=' + totals.get(key).setScale(2));
+            }
+            return result + String.join(parts, ', ') + '\n';
+        } catch (Exception e) {
+            // Non-critical — if totals computation fails, Claude will compute them itself
+            return null;
+        }
+    }
+
+    /**
+     * Trims a JSON array string to fit within a character budget.
+     * Keeps the first N elements (top rows from ORDER BY DESC) that fit.
+     * Returns valid JSON array.
+     */
+    @TestVisible
+    private static String trimJsonToFit(String jsonArrayStr, Integer maxChars) {
+        try {
+            List<Object> rows = (List<Object>) JSON.deserializeUntyped(jsonArrayStr);
+            if (rows == null || rows.isEmpty()) return jsonArrayStr;
+
+            // Binary search-ish: start with estimated rows that fit, then adjust
+            // Average ~150-200 chars per row for aggregate results
+            Integer estimatedRows = Math.max(50, maxChars / 200);
+            if (estimatedRows >= rows.size()) return jsonArrayStr; // Already fits
+
+            // Keep top rows (already sorted by SOQL ORDER BY DESC)
+            List<Object> trimmed = new List<Object>();
+            for (Integer i = 0; i < Math.min(estimatedRows, rows.size()); i++) {
+                trimmed.add(rows.get(i));
+            }
+
+            String result = JSON.serialize(trimmed);
+            // If still too large, halve and retry
+            while (result.length() > maxChars && trimmed.size() > 20) {
+                Integer halfSize = trimmed.size() / 2;
+                List<Object> smaller = new List<Object>();
+                for (Integer i = 0; i < halfSize; i++) {
+                    smaller.add(trimmed.get(i));
+                }
+                trimmed = smaller;
+                result = JSON.serialize(trimmed);
+            }
+            return result;
+        } catch (Exception e) {
+            // If parsing fails, do a simple character truncation
+            if (jsonArrayStr.length() > maxChars) {
+                // Find last complete JSON object within budget
+                Integer cutPoint = jsonArrayStr.lastIndexOf('},', maxChars);
+                if (cutPoint > 0) {
+                    return jsonArrayStr.substring(0, cutPoint + 1) + ']';
+                }
+            }
+            return jsonArrayStr;
+        }
+    }
+
+    /**
+     * Uses Database.countQuery() which costs only 1 query row (NOT counted against 50K limit).
+     * FAIL-CLOSED: for known large objects, estimation failure returns ROW_SAFETY_LIMIT + 1
+     * to force the REST API path. For unknown objects, returns 0 (safe to proceed).
+     */
+    private static Integer estimateQueryRows(String soql) {
+        String objectName = null;
+        try {
+            objectName = SoqlSanitizer.extractObjectName(soql);
+            if (objectName == null) return 0;
+
+            // Build COUNT query: keep FROM + WHERE, strip SELECT fields + GROUP BY + ORDER BY + LIMIT
+            Pattern fromPattern = Pattern.compile('(?i)\\bFROM\\s+\\w+');
+            Matcher fromMatcher = fromPattern.matcher(soql);
+            if (!fromMatcher.find()) {
+                return KNOWN_LARGE_OBJECTS.contains(objectName.toLowerCase()) ? ROW_SAFETY_LIMIT + 1 : 0;
+            }
+            String fromClause = fromMatcher.group();
+
+            // Find WHERE clause (if any) — everything between WHERE and GROUP BY/ORDER BY/LIMIT/HAVING/end
+            String whereClause = '';
+            Pattern wherePattern = Pattern.compile('(?i)\\bWHERE\\b(.+?)(?:\\bGROUP\\s+BY\\b|\\bORDER\\s+BY\\b|\\bLIMIT\\b|\\bHAVING\\b|$)');
+            Matcher whereMatcher = wherePattern.matcher(soql);
+            if (whereMatcher.find()) {
+                whereClause = ' WHERE' + whereMatcher.group(1);
+            }
+
+            String countSoql = 'SELECT COUNT() ' + fromClause + whereClause;
+            return Database.countQuery(countSoql);
+        } catch (Exception e) {
+            // FAIL CLOSED for known large objects: if we can't estimate, assume it's too large
+            if (objectName != null && KNOWN_LARGE_OBJECTS.contains(objectName.toLowerCase())) {
+                System.debug(LoggingLevel.WARN, 'Row estimation failed for large object ' +
+                    objectName + ': ' + e.getMessage() + '. Routing to REST API (fail-closed).');
+                return ROW_SAFETY_LIMIT + 1;
+            }
+            // Unknown objects: fail open (proceed with Database.query)
+            System.debug(LoggingLevel.WARN, 'Row estimation failed for ' + objectName + ': ' + e.getMessage());
+            return 0;
+        }
+    }
+
+    // Transaction-scoped cache: avoids repeated OAuth exchanges for multi-query analyses
+    private static String cachedAccessToken;
+
+    /**
+     * Gets an API-enabled access token via OAuth refresh_token grant.
+     * Lightning sessions are NOT API-enabled, so we use the stored refresh token
+     * from AI_Assistant_Config__mdt to get a fresh API-enabled access token.
+     * Caches the token for the duration of the transaction (up to 5 queries per askQuestion call).
+     * Falls back to UserInfo.getSessionId() if no refresh token is configured.
+     */
+    private static String getApiAccessToken() {
+        if (cachedAccessToken != null) {
+            return cachedAccessToken;
+        }
+        // Read OAuth config from Custom Metadata
+        AI_Assistant_Config__mdt config = AI_Assistant_Config__mdt.getInstance('Claude_API');
+        String refreshToken = config?.SF_Refresh_Token__c;
+        String clientId = config?.SF_Client_Id__c;
+
+        if (String.isNotBlank(refreshToken) && String.isNotBlank(clientId)) {
+            // Exchange refresh token for a fresh API-enabled access token
+            HttpRequest tokenReq = new HttpRequest();
+            tokenReq.setEndpoint(URL.getOrgDomainUrl().toExternalForm() + '/services/oauth2/token');
+            tokenReq.setMethod('POST');
+            tokenReq.setHeader('Content-Type', 'application/x-www-form-urlencoded');
+            tokenReq.setBody('grant_type=refresh_token&client_id=' +
+                EncodingUtil.urlEncode(clientId, 'UTF-8') +
+                '&refresh_token=' + EncodingUtil.urlEncode(refreshToken, 'UTF-8'));
+            tokenReq.setTimeout(15000);
+
+            HttpResponse tokenRes = new Http().send(tokenReq);
+            if (tokenRes.getStatusCode() == 200) {
+                Map<String, Object> tokenData =
+                    (Map<String, Object>) JSON.deserializeUntyped(tokenRes.getBody());
+                cachedAccessToken = (String) tokenData.get('access_token');
+                return cachedAccessToken;
+            }
+            System.debug(LoggingLevel.WARN, 'OAuth token exchange failed: ' +
+                tokenRes.getStatusCode() + ' - falling back to session ID');
+        }
+
+        // Fallback: try the current session ID (works in non-Lightning contexts)
+        String sessionId = UserInfo.getSessionId();
+        if (String.isNotBlank(sessionId)) {
+            cachedAccessToken = sessionId;
+            return cachedAccessToken;
+        }
+
+        throw new System.QueryException(
+            'Cannot execute large query: no API credentials available. ' +
+            'Configure SF_Refresh_Token__c and SF_Client_Id__c in AI Assistant Config custom metadata.'
+        );
+    }
+
+    /**
+     * Executes a SOQL query via REST API callout to the org's own endpoint.
+     * This creates a SEPARATE execution context with its own 50K row governor limit,
+     * bypassing the cumulative limit of the current Apex transaction.
+     * Used for large queries (accounts_revenue__c full-year, etc.) that would exceed
+     * the synchronous 50K limit.
+     *
+     * NOTE on CRUD/FLS: The REST callout authenticates as the refresh-token owner
+     * (currently the same admin who set up the integration). The REST API enforces
+     * that user's profile permissions. For stricter per-user FLS, migrate to Named
+     * Credentials with Per-User principal when the org allows Connected App creation.
+     *
+     * Handles REST API pagination: follows nextRecordsUrl until all pages are fetched
+     * (capped at 10 pages / ~20,000 rows to avoid callout limits).
+     */
+    private static QueryResult executeViaRestApi(String soql) {
+        QueryResult qr = new QueryResult();
+        qr.finalSoql = soql;
+
+        String accessToken = cachedAccessToken != null ? cachedAccessToken : getApiAccessToken();
+
+        String baseUrl = URL.getOrgDomainUrl().toExternalForm();
+        String nextUrl = baseUrl + '/services/data/v60.0/query?q=' +
+            EncodingUtil.urlEncode(soql, 'UTF-8');
+
+        List<Map<String, Object>> allCleanRecords = new List<Map<String, Object>>();
+        Integer totalSize = 0;
+        Integer pageCount = 0;
+        final Integer MAX_PAGES = 10; // Safety cap: 10 pages × 2000 rows = 20K max
+
+        while (nextUrl != null && pageCount < MAX_PAGES) {
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint(nextUrl);
+            req.setMethod('GET');
+            req.setHeader('Authorization', 'Bearer ' + accessToken);
+            req.setHeader('Content-Type', 'application/json');
+            req.setTimeout(30000);
+
+            HttpResponse res = new Http().send(req);
+
+            if (res.getStatusCode() != 200) {
+                String errMsg = 'REST API query failed (HTTP ' + res.getStatusCode() + ')';
+                try {
+                    List<Object> errors = (List<Object>) JSON.deserializeUntyped(res.getBody());
+                    if (!errors.isEmpty()) {
+                        Map<String, Object> firstErr = (Map<String, Object>) errors[0];
+                        errMsg = (String) firstErr.get('message');
+                    }
+                } catch (Exception parseEx) {
+                    errMsg += ': ' + res.getBody().abbreviate(500);
+                }
+                throw new System.QueryException(errMsg);
+            }
+
+            Map<String, Object> responseMap = (Map<String, Object>) JSON.deserializeUntyped(res.getBody());
+
+            if (pageCount == 0) {
+                totalSize = (Integer) responseMap.get('totalSize');
+            }
+
+            List<Object> records = (List<Object>) responseMap.get('records');
+            for (Object rec : records) {
+                Map<String, Object> recMap = (Map<String, Object>) rec;
+                recMap.remove('attributes');
+                allCleanRecords.add(recMap);
+            }
+
+            // Check for next page
+            Boolean done = (Boolean) responseMap.get('done');
+            if (done == true || done == null) {
+                nextUrl = null;
+            } else {
+                String nextRecordsUrl = (String) responseMap.get('nextRecordsUrl');
+                nextUrl = nextRecordsUrl != null ? baseUrl + nextRecordsUrl : null;
+            }
+            pageCount++;
+        }
+
+        qr.restApiJson = JSON.serialize(allCleanRecords);
+        qr.restApiRecordCount = allCleanRecords.size(); // Actual fetched count
+        qr.restApiTotalSize = totalSize;                // Salesforce's full count
+        qr.restApiTruncated = (allCleanRecords.size() < totalSize);
+        return qr;
     }
 
     /**
      * Executes a SOQL query with up to 2 self-correction retries via Claude.
+     * Pre-checks row count: if too large for synchronous execution, routes to
+     * REST API callout (separate execution context with own 50K limit).
      * Returns both the results and the (possibly corrected) final SOQL.
      */
     private static QueryResult executeWithRetry(String soql, String context) {
@@ -803,10 +1963,35 @@ public with sharing class AiSalesAssistantController {
 
         for (Integer attempt = 0; attempt < 3; attempt++) {
             try {
+                // Pre-check: will this query exceed the governor limit?
+                Integer headroom = Limits.getLimitQueryRows() - Limits.getQueryRows();
+                Integer estimatedRows = estimateQueryRows(qr.finalSoql);
+
+                Boolean tooManyRows = estimatedRows > 0 &&
+                    (estimatedRows > ROW_SAFETY_LIMIT || estimatedRows > headroom - 1000);
+                if (tooManyRows || forceRestApiExecution) {
+                    // Too many rows for synchronous Database.query() — use REST API callout.
+                    // Each REST API call gets its own execution context with a fresh 50K limit.
+                    // NOTE: REST path executes under the OAuth principal's CRUD/FLS, not the
+                    // LWC user's. Acceptable for admin-only read-only aggregate queries.
+                    // For per-user FLS, migrate to Named Credentials with Per-User principal.
+                    System.debug('Pre-check: ' + estimatedRows + ' rows estimated (headroom: ' +
+                        headroom + '). Routing to REST API callout.');
+                    return executeViaRestApi(qr.finalSoql);
+                }
+
                 qr.records = Database.query(qr.finalSoql);
+                // CRUD/FLS enforcement: strip fields the running user cannot read
+                if (!qr.records.isEmpty()) {
+                    SObjectAccessDecision decision = Security.stripInaccessible(
+                        AccessType.READABLE, qr.records
+                    );
+                    qr.records = decision.getRecords();
+                }
                 return qr;
             } catch (System.QueryException e) {
                 lastQueryError = e;
+                qr.retries++;
                 if (attempt < 2) {
                     try {
                         String fixPrompt =

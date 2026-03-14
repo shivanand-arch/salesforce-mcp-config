@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>UserMessageTemplate__c</fullName>
+    <label>User Message Template</label>
+    <description>Fallback message shown when domain is not queryable via SOQL</description>
+    <type>LongTextArea</type>
+    <length>5000</length>
+    <visibleLines>5</visibleLines>
+    <required>false</required>
+</CustomField>

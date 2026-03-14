@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>DefaultTimegrain__c</fullName>
+    <label>Default Timegrain</label>
+    <description>Default time granularity for this domain: MONTH, WEEK, QUARTER, DAY</description>
+    <type>Text</type>
+    <length>40</length>
+    <required>false</required>
+</CustomField>

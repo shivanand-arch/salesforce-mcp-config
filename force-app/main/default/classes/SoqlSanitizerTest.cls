@@ -405,6 +405,129 @@ private class SoqlSanitizerTest {
         System.assert(SoqlSanitizer.isAllowedObject('SELECT Id FROM Opp_Related_Programs__c LIMIT 10'), 'Opp_Related_Programs__c should be allowed');
     }
 
+    // --- Large Object Safety (Governor Limit Prevention) ---
+
+    @isTest
+    static void testLargeObjectSafety_InjectsDateFilter_NoWhere() {
+        // accounts_revenue__c with no WHERE should get a date filter injected
+        String input = 'SELECT Cluster__c, SUM(Revenue_Booked_Amount__c) rev FROM accounts_revenue__c GROUP BY Cluster__c';
+        String result = SoqlSanitizer.sanitize(input);
+        System.assert(result.contains('Revenue_Booked_On__c'),
+            'Should inject Revenue_Booked_On__c date filter for large object: ' + result);
+        System.assert(result.contains('WHERE'),
+            'Should add WHERE clause: ' + result);
+    }
+
+    @isTest
+    static void testLargeObjectSafety_InjectsDateFilter_WhereNoDate() {
+        // accounts_revenue__c with WHERE but no date filter
+        String input = 'SELECT Cluster__c, SUM(Revenue_Booked_Amount__c) rev FROM accounts_revenue__c WHERE Region__c = \'Domestic Enterprise\' GROUP BY Cluster__c';
+        String result = SoqlSanitizer.sanitize(input);
+        System.assert(result.contains('Revenue_Booked_On__c'),
+            'Should inject date filter even with existing WHERE: ' + result);
+        System.assert(result.contains('AND Revenue_Booked_On__c'),
+            'Should AND the date filter: ' + result);
+    }
+
+    @isTest
+    static void testLargeObjectSafety_SkipsWhenDatePresent() {
+        // accounts_revenue__c with date filter already present — should not double-add
+        String input = 'SELECT Cluster__c, SUM(Revenue_Booked_Amount__c) rev FROM accounts_revenue__c WHERE Revenue_Booked_On__c >= 2025-04-01 GROUP BY Cluster__c';
+        String result = SoqlSanitizer.sanitize(input);
+        // Count occurrences of Revenue_Booked_On__c — should appear only in the existing filter
+        Integer firstIdx = result.indexOf('Revenue_Booked_On__c');
+        Integer secondIdx = result.indexOf('Revenue_Booked_On__c', firstIdx + 1);
+        System.assertEquals(-1, secondIdx,
+            'Should NOT inject duplicate date filter: ' + result);
+    }
+
+    @isTest
+    static void testLargeObjectSafety_DateInSelectNotWhere() {
+        // CRITICAL BUG FIX: Date field in SELECT/GROUP BY but NOT in WHERE should still inject.
+        // "SELECT Revenue_Booked_On__c, SUM(...) FROM accounts_revenue__c WHERE Region__c='X' GROUP BY Revenue_Booked_On__c"
+        // has Revenue_Booked_On__c in SELECT and GROUP BY, but NOT as a date filter in WHERE.
+        String input = 'SELECT Revenue_Booked_On__c, SUM(Revenue_Booked_Amount__c) rev FROM accounts_revenue__c WHERE Region__c = \'Domestic Enterprise\' GROUP BY Revenue_Booked_On__c';
+        String result = SoqlSanitizer.sanitize(input);
+        // Should inject date filter because the WHERE clause only has Region__c, not a date range
+        System.assert(result.contains('AND Revenue_Booked_On__c >='),
+            'Should inject date filter when date field is only in SELECT/GROUP BY, not WHERE: ' + result);
+    }
+
+    @isTest
+    static void testExtractWhereClause() {
+        // Test the WHERE clause extraction helper
+        String where1 = SoqlSanitizer.extractWhereClause(
+            'SELECT Id FROM Account WHERE Name = \'Test\' AND Industry = \'Tech\' GROUP BY Industry');
+        System.assert(where1 != null, 'Should extract WHERE clause');
+        System.assert(where1.contains('Name'), 'WHERE clause should contain Name');
+        System.assert(!where1.contains('GROUP BY'), 'WHERE clause should not contain GROUP BY');
+
+        String where2 = SoqlSanitizer.extractWhereClause(
+            'SELECT Id FROM Account ORDER BY Name');
+        System.assertEquals(null, where2, 'Should return null when no WHERE clause');
+    }
+
+    @isTest
+    static void testLargeObjectSafety_SkipsSmallObjects() {
+        // Account is not in LARGE_OBJECT_DATE_FIELDS — should not inject date filter
+        String input = 'SELECT Cluster__c, COUNT(Id) FROM Account GROUP BY Cluster__c';
+        String result = SoqlSanitizer.sanitize(input);
+        System.assert(!result.contains('CreatedDate'),
+            'Should NOT inject date filter for small objects: ' + result);
+    }
+
+    @isTest
+    static void testLargeObjectSafety_CaseObject() {
+        // Case is a large object — should inject CreatedDate filter with DateTime format
+        String input = 'SELECT Status, COUNT(Id) FROM Case GROUP BY Status';
+        String result = SoqlSanitizer.sanitize(input);
+        System.assert(result.contains('CreatedDate'),
+            'Should inject CreatedDate for Case: ' + result);
+        System.assert(result.contains('T00:00:00Z'),
+            'Should use DateTime format for CreatedDate: ' + result);
+    }
+
+    @isTest
+    static void testLargeObjectSafety_SkipsLastNDays() {
+        // LAST_N_DAYS is a valid date filter — should skip injection
+        String input = 'SELECT Cluster__c, SUM(Revenue_Booked_Amount__c) rev FROM accounts_revenue__c WHERE CreatedDate = LAST_N_DAYS:90 GROUP BY Cluster__c';
+        String result = SoqlSanitizer.sanitize(input);
+        Integer dateFieldCount = 0;
+        Integer searchFrom = 0;
+        while (result.indexOf('Revenue_Booked_On__c', searchFrom) >= 0) {
+            dateFieldCount++;
+            searchFrom = result.indexOf('Revenue_Booked_On__c', searchFrom) + 1;
+        }
+        System.assertEquals(0, dateFieldCount,
+            'Should NOT inject date filter when LAST_N_DAYS present: ' + result);
+    }
+
+    @isTest
+    static void testLargeObjectSafety_NewlineBeforeWhere() {
+        // Claude often generates SOQL with newlines — WHERE detection must handle this
+        String input = 'SELECT Cluster__c, SUM(Revenue_Booked_Amount__c) rev\nFROM accounts_revenue__c\nWHERE SKU__c = \'Voice\'\nGROUP BY Cluster__c';
+        String result = SoqlSanitizer.sanitize(input);
+        // Should NOT have double WHERE
+        Integer firstWhere = result.toUpperCase().indexOf('WHERE');
+        Integer secondWhere = result.toUpperCase().indexOf('WHERE', firstWhere + 5);
+        System.assertEquals(-1, secondWhere,
+            'Should NOT inject double WHERE when newline precedes existing WHERE: ' + result);
+        // Should AND the date filter to existing WHERE
+        System.assert(result.contains('AND Revenue_Booked_On__c'),
+            'Should AND date filter to existing WHERE: ' + result);
+    }
+
+    @isTest
+    static void testLargeObjectSafety_NonAggregateQuery() {
+        // Non-aggregate query on accounts_revenue__c without date filter
+        String input = 'SELECT Id, Customer_Name__c, Revenue_Booked_Amount__c FROM accounts_revenue__c WHERE Cluster__c = \'BFSI\'';
+        String result = SoqlSanitizer.sanitize(input);
+        System.assert(result.contains('Revenue_Booked_On__c'),
+            'Should inject date filter on non-aggregate large object query: ' + result);
+        System.assert(result.contains('LIMIT'),
+            'Should also have LIMIT: ' + result);
+    }
+
     @isTest
     static void testFixFieldAliases_RelationshipWithRole() {
         String input = 'SELECT Id, Account.Name acctName, Owner.Name ownerName, Owner.UserRole.Name roleName FROM Opportunity LIMIT 10';

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<RemoteSiteSetting xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Salesforce_Self</fullName>
+    <description>Self-org REST API endpoint for executing large SOQL queries via REST callout to bypass per-transaction governor limits</description>
+    <disableProtocolSecurity>false</disableProtocolSecurity>
+    <isActive>true</isActive>
+    <url>https://ameyo.my.salesforce.com</url>
+</RemoteSiteSetting>

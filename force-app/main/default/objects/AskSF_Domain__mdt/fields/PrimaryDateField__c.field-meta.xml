@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>PrimaryDateField__c</fullName>
+    <label>Primary Date Field</label>
+    <description>Default date filter field for this domain (e.g., Revenue_Booked_On__c, CreatedDate)</description>
+    <type>Text</type>
+    <length>80</length>
+    <required>false</required>
+</CustomField>

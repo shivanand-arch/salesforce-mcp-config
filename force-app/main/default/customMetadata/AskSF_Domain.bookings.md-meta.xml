@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomMetadata xmlns="http://soap.sforce.com/2006/04/metadata"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <label>Order Bookings</label>
+    <protected>false</protected>
+    <values>
+        <field>SourceType__c</field>
+        <value xsi:type="xsd:string">LIVE_SF</value>
+    </values>
+    <values>
+        <field>Queryable__c</field>
+        <value xsi:type="xsd:boolean">true</value>
+    </values>
+    <values>
+        <field>Parity__c</field>
+        <value xsi:type="xsd:string">EXACT</value>
+    </values>
+    <values>
+        <field>PrimaryObject__c</field>
+        <value xsi:type="xsd:string">Opportunity</value>
+    </values>
+    <values>
+        <field>PrimaryDateField__c</field>
+        <value xsi:type="xsd:string">B_Deal_Date__c</value>
+    </values>
+    <values>
+        <field>DefaultTimegrain__c</field>
+        <value xsi:type="xsd:string">MONTH</value>
+    </values>
+    <values>
+        <field>ResponseMode__c</field>
+        <value xsi:type="xsd:string">DATA</value>
+    </values>
+    <values>
+        <field>SortOrder__c</field>
+        <value xsi:type="xsd:double">20</value>
+    </values>
+    <values>
+        <field>AllowedMeasures__c</field>
+        <value xsi:type="xsd:string">Net_New_INR__c,Net_New__c,Amount,MRR_Amount__c,One_Time_Value__c,Full_Potential_Value__c</value>
+    </values>
+    <values>
+        <field>AllowedDimensions__c</field>
+        <value xsi:type="xsd:string">Account_Cluster__c,Account_Region__c,SKU__c,Deal_Type__c,Classification_Type__c,Use_Case__c,Forecast_Category__c,Owner.Name,LeadSource,Loss_Reason__c,StageName</value>
+    </values>
+    <values>
+        <field>DomainKeywords__c</field>
+        <value xsi:type="xsd:string">bookings,order booking,deals won,order value,net new,OB</value>
+    </values>
+</CustomMetadata>

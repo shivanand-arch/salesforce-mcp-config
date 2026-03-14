@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Parity__c</fullName>
+    <label>Parity</label>
+    <description>How closely Ask SF answers match Tableau dashboard values</description>
+    <required>true</required>
+    <type>Picklist</type>
+    <valueSet>
+        <restricted>true</restricted>
+        <valueSetDefinition>
+            <sorted>false</sorted>
+            <value>
+                <fullName>EXACT</fullName>
+                <default>true</default>
+                <label>EXACT</label>
+            </value>
+            <value>
+                <fullName>APPROXIMATE</fullName>
+                <default>false</default>
+                <label>APPROXIMATE</label>
+            </value>
+            <value>
+                <fullName>NOT_SUPPORTED</fullName>
+                <default>false</default>
+                <label>NOT_SUPPORTED</label>
+            </value>
+        </valueSetDefinition>
+    </valueSet>
+</CustomField>

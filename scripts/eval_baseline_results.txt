@@ -1,0 +1,15 @@
+========== REVENUE EVAL BASELINE ==========
+Run date: 2026-03-14 11:38:31
+==========================================
+REV-01|simple_total|PASS|accounts_revenue__c|true|48|32917|2|SELECT Cluster__c, Currency__c, SUM(Revenue_Booked_Amount__c) totalRevenue
+REV-02|simple_total|PASS|accounts_revenue__c|true|144|31142|0|SELECT Cluster__c, Parent_SKU__c, Currency__c, SUM(GP__c) totalGP, SUM(Revenue_Booked_Amount__c) totalRev
+REV-03|simple_total|PASS|accounts_revenue__c|true|284|24390|2|SELECT Cluster__c, Parent_SKU__c, Currency__c, SUM(Variable_Cost__c) totalVariableCost
+REV-04|simple_total|PASS|accounts_revenue__c|true|0|13111|0|SELECT Cluster__c, Parent_SKU__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev
+REV-05|simple_total|PASS|accounts_revenue__c|true|140|21952|0|SELECT Cluster__c, Parent_SKU__c, Currency__c,
+REV-06|grouped|PASS|accounts_revenue__c|true|48|47091|2|SELECT Cluster__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev
+REV-07|grouped|PASS|accounts_revenue__c|true|14|29503|0|SELECT SKU__c, Currency__c, SUM(GP__c) totalGP, SUM(Revenue_Booked_Amount__c) totalRev
+REV-08|grouped|PASS|accounts_revenue__c|true|59|41199|2|SELECT Region__c, Cluster__c, Currency__c, SUM(Revenue_Booked_Amount__c) revenue
+REV-09|grouped|PASS|accounts_revenue__c|true|6|24064|0|SELECT Parent_SKU__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev
+REV-10|grouped|PASS|accounts_revenue__c|true|2|23058|2|SELECT Account_Manager__c, SUM(Revenue_Booked_Amount__c) totalRevenue, Currency__c
+REV-11|grouped|ERROR|exit_1|||
+REV-12|grouped|PASS|accounts_revenue__c|true|5|25016|0|SELECT Revenue_Classification__c, Currency__c, SUM(GP__c) totalGP, SUM(Revenue_Booked_Amount__c) totalRev

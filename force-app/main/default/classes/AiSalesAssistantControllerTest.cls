@@ -1121,4 +1121,285 @@ private class AiSalesAssistantControllerTest {
         System.assertNotEquals(null, badError, 'Invalid plan should fail validation');
         System.assert(badError.contains('BadField__c'), 'Error should mention the bad field');
     }
+
+    // === Semantic Override Engine Tests ===
+
+    private static List<Map<String, Object>> buildTestRegistry() {
+        // Minimal registry with just the critical overrides for testing
+        String json_str = '[' +
+            '{"id":"region_scaleup","terms":["scaleup","scaleups","scale up"],' +
+            '"correctField":"Region__c","correctValue":"Scaleup",' +
+            '"forbiddenFields":["Cluster__c","Account_Cluster__c"],' +
+            '"reason":"Scaleup is a Region__c value."},' +
+            '{"id":"region_domestic","terms":["domestic","domestic enterprise"],' +
+            '"correctField":"Region__c","correctValue":"Domestic Enterprise",' +
+            '"forbiddenFields":["Cluster__c","Account_Cluster__c"],' +
+            '"reason":"Domestic Enterprise is a Region__c value."},' +
+            '{"id":"cluster_apac","terms":["apac","asia pacific"],' +
+            '"correctField":"Cluster__c","correctValue":"APAC",' +
+            '"forbiddenFields":["Region__c","Account_Region__c"],' +
+            '"reason":"APAC is a Cluster__c value."},' +
+            '{"id":"cluster_ksa","terms":["ksa","saudi"],' +
+            '"correctField":"Cluster__c","correctValue":"KSA",' +
+            '"forbiddenFields":["Region__c","Account_Region__c"],' +
+            '"reason":"KSA is a Cluster__c value."},' +
+            '{"id":"cluster_uae","terms":["uae","emirates","dubai"],' +
+            '"correctField":"Cluster__c","correctValue":"UAE",' +
+            '"forbiddenFields":["Region__c","Account_Region__c"],' +
+            '"reason":"UAE is a Cluster__c value."},' +
+            '{"id":"cluster_mena","terms":["mena","middle east"],' +
+            '"correctField":"Cluster__c","correctValue":["UAE","KSA"],' +
+            '"forbiddenFields":["Region__c","Account_Region__c"],' +
+            '"reason":"MENA maps to Cluster__c IN (UAE, KSA)."}' +
+        ']';
+        List<Object> parsed = (List<Object>) JSON.deserializeUntyped(json_str);
+        List<Map<String, Object>> registry = new List<Map<String, Object>>();
+        for (Object o : parsed) {
+            registry.add((Map<String, Object>) o);
+        }
+        return registry;
+    }
+
+    @isTest
+    static void testDetectOverrides_ScaleupMatchesRegion() {
+        AiSalesAssistantController.testRegistryOverride = buildTestRegistry();
+
+        List<AiSalesAssistantController.SemanticOverride> overrides =
+            AiSalesAssistantController.detectOverrides('How much GP has scaleups contributed this FY?');
+
+        System.assertEquals(1, overrides.size(), 'Should detect one override');
+        System.assertEquals('region_scaleup', overrides[0].overrideId);
+        System.assertEquals('Region__c', overrides[0].correctField);
+        System.assertEquals('Scaleup', overrides[0].correctValue);
+        System.assert(overrides[0].forbiddenFields.contains('cluster__c'),
+            'Cluster__c should be forbidden');
+
+        AiSalesAssistantController.testRegistryOverride = null;
+    }
+
+    @isTest
+    static void testDetectOverrides_APACMatchesCluster() {
+        AiSalesAssistantController.testRegistryOverride = buildTestRegistry();
+
+        List<AiSalesAssistantController.SemanticOverride> overrides =
+            AiSalesAssistantController.detectOverrides('Revenue for APAC region this year');
+
+        System.assertEquals(1, overrides.size(), 'Should detect one override');
+        System.assertEquals('cluster_apac', overrides[0].overrideId);
+        System.assertEquals('Cluster__c', overrides[0].correctField);
+        System.assertEquals('APAC', overrides[0].correctValue);
+        System.assert(overrides[0].forbiddenFields.contains('region__c'),
+            'Region__c should be forbidden for APAC');
+
+        AiSalesAssistantController.testRegistryOverride = null;
+    }
+
+    @isTest
+    static void testDetectOverrides_UAEMatchesCluster() {
+        AiSalesAssistantController.testRegistryOverride = buildTestRegistry();
+
+        List<AiSalesAssistantController.SemanticOverride> overrides =
+            AiSalesAssistantController.detectOverrides('How is UAE performing on revenue?');
+
+        System.assertEquals(1, overrides.size());
+        System.assertEquals('cluster_uae', overrides[0].overrideId);
+        System.assertEquals('Cluster__c', overrides[0].correctField);
+
+        AiSalesAssistantController.testRegistryOverride = null;
+    }
+
+    @isTest
+    static void testDetectOverrides_MENAMultiValue() {
+        AiSalesAssistantController.testRegistryOverride = buildTestRegistry();
+
+        List<AiSalesAssistantController.SemanticOverride> overrides =
+            AiSalesAssistantController.detectOverrides('Total MENA revenue');
+
+        System.assertEquals(1, overrides.size());
+        System.assertEquals('cluster_mena', overrides[0].overrideId);
+        System.assert(overrides[0].correctValue instanceof List<Object>,
+            'MENA should have multi-value correctValue');
+
+        AiSalesAssistantController.testRegistryOverride = null;
+    }
+
+    @isTest
+    static void testDetectOverrides_NoMatch() {
+        AiSalesAssistantController.testRegistryOverride = buildTestRegistry();
+
+        List<AiSalesAssistantController.SemanticOverride> overrides =
+            AiSalesAssistantController.detectOverrides('Total revenue this year');
+
+        System.assertEquals(0, overrides.size(), 'No overrides should match');
+
+        AiSalesAssistantController.testRegistryOverride = null;
+    }
+
+    @isTest
+    static void testDetectOverrides_WholeWordOnly() {
+        AiSalesAssistantController.testRegistryOverride = buildTestRegistry();
+
+        // "scaling" should NOT match "scale" because 'g' follows
+        List<AiSalesAssistantController.SemanticOverride> overrides =
+            AiSalesAssistantController.detectOverrides('We are scaling our operations');
+
+        // "scale" should not match "scaling" (right bound is alpha)
+        Boolean hasScaleup = false;
+        for (AiSalesAssistantController.SemanticOverride so : overrides) {
+            if (so.overrideId == 'region_scaleup') hasScaleup = true;
+        }
+        System.assertEquals(false, hasScaleup, 'scaling should not trigger scaleup override');
+
+        AiSalesAssistantController.testRegistryOverride = null;
+    }
+
+    @isTest
+    static void testApplyOverridesToPlan_FixesClusterToRegion() {
+        AiSalesAssistantController.testRegistryOverride = buildTestRegistry();
+
+        // Simulate a plan that wrongly uses Cluster__c = 'Scaleup'
+        Map<String, Object> plan = (Map<String, Object>) JSON.deserializeUntyped(
+            '{"domain":"revenue","intent":"aggregate","object":"accounts_revenue__c",' +
+            '"measures":[{"fn":"SUM","field":"GP__c","alias":"gp"}],' +
+            '"dimensions":["Cluster__c","Currency__c"],' +
+            '"filters":[{"field":"Cluster__c","op":"=","value":"Scaleup"}],' +
+            '"dateFilter":{"field":"Revenue_Booked_On__c","start":"2025-04-01","end":"2026-03-14"},' +
+            '"sort":{"field":"gp","direction":"DESC"},"limit":2000}'
+        );
+
+        List<AiSalesAssistantController.SemanticOverride> overrides =
+            AiSalesAssistantController.detectOverrides('GP for scaleups this FY');
+
+        List<String> applied = AiSalesAssistantController.applyOverridesToPlan(plan, overrides);
+        System.assert(applied.contains('region_scaleup'), 'Should have applied region_scaleup override');
+
+        // Verify the filter was corrected
+        List<Object> filters = (List<Object>) plan.get('filters');
+        Boolean hasRegionFilter = false;
+        Boolean hasClusterFilter = false;
+        for (Object fObj : filters) {
+            Map<String, Object> f = (Map<String, Object>) fObj;
+            String field = (String) f.get('field');
+            if (field == 'Region__c') hasRegionFilter = true;
+            if (field == 'Cluster__c') hasClusterFilter = true;
+        }
+        System.assertEquals(true, hasRegionFilter, 'Should have Region__c filter');
+        System.assertEquals(false, hasClusterFilter, 'Should NOT have Cluster__c filter');
+
+        // Verify dimensions were corrected too
+        List<Object> dims = (List<Object>) plan.get('dimensions');
+        Boolean hasRegionDim = false;
+        for (Object d : dims) {
+            if ((String) d == 'Region__c') hasRegionDim = true;
+        }
+        System.assertEquals(true, hasRegionDim, 'Cluster__c dimension should be replaced with Region__c');
+
+        AiSalesAssistantController.testRegistryOverride = null;
+    }
+
+    @isTest
+    static void testApplyOverridesToSoql_FixesClusterToRegion() {
+        AiSalesAssistantController.testRegistryOverride = buildTestRegistry();
+
+        String wrongSoql = 'SELECT Cluster__c, Currency__c, SUM(GP__c) gp ' +
+            'FROM accounts_revenue__c ' +
+            'WHERE Revenue_Booked_On__c >= 2025-04-01 AND Revenue_Booked_On__c <= 2026-03-14 ' +
+            'AND Cluster__c = \'Scaleup\' ' +
+            'GROUP BY Cluster__c, Currency__c ORDER BY SUM(GP__c) DESC LIMIT 200';
+
+        List<AiSalesAssistantController.SemanticOverride> overrides =
+            AiSalesAssistantController.detectOverrides('GP for scaleup this year');
+
+        Map<String, Object> result =
+            AiSalesAssistantController.applyOverridesToSoql(wrongSoql, overrides);
+
+        String correctedSoql = (String) result.get('soql');
+        List<String> applied = (List<String>) result.get('applied');
+
+        System.assert(applied.contains('region_scaleup'), 'Should have applied override');
+        System.assert(correctedSoql.contains('Region__c'), 'Should contain Region__c');
+        System.assert(!correctedSoql.contains('Cluster__c'), 'Should NOT contain Cluster__c');
+
+        AiSalesAssistantController.testRegistryOverride = null;
+    }
+
+    @isTest
+    static void testCheckForbiddenFields_DetectsViolation() {
+        AiSalesAssistantController.testRegistryOverride = buildTestRegistry();
+
+        Map<String, Object> plan = (Map<String, Object>) JSON.deserializeUntyped(
+            '{"domain":"revenue","intent":"aggregate","object":"accounts_revenue__c",' +
+            '"measures":[{"fn":"SUM","field":"GP__c","alias":"gp"}],' +
+            '"dimensions":["Cluster__c"],' +
+            '"filters":[{"field":"Cluster__c","op":"=","value":"Scaleup"}],' +
+            '"dateFilter":{"field":"Revenue_Booked_On__c","start":"2025-04-01","end":"2026-03-14"},' +
+            '"sort":{"field":"gp","direction":"DESC"},"limit":2000}'
+        );
+
+        List<AiSalesAssistantController.SemanticOverride> overrides =
+            AiSalesAssistantController.detectOverrides('GP for scaleups');
+
+        String error = AiSalesAssistantController.checkForbiddenFields(plan, overrides);
+        System.assertNotEquals(null, error, 'Should detect forbidden field violation');
+        System.assert(error.contains('Cluster__c'), 'Error should mention Cluster__c');
+        System.assert(error.contains('Region__c'), 'Error should mention correct field Region__c');
+
+        AiSalesAssistantController.testRegistryOverride = null;
+    }
+
+    @isTest
+    static void testCheckForbiddenFields_CleanPlan() {
+        AiSalesAssistantController.testRegistryOverride = buildTestRegistry();
+
+        // Plan correctly uses Region__c for Scaleup
+        Map<String, Object> plan = (Map<String, Object>) JSON.deserializeUntyped(
+            '{"domain":"revenue","intent":"aggregate","object":"accounts_revenue__c",' +
+            '"measures":[{"fn":"SUM","field":"GP__c","alias":"gp"}],' +
+            '"dimensions":["Region__c"],' +
+            '"filters":[{"field":"Region__c","op":"=","value":"Scaleup"}],' +
+            '"dateFilter":{"field":"Revenue_Booked_On__c","start":"2025-04-01","end":"2026-03-14"},' +
+            '"sort":{"field":"gp","direction":"DESC"},"limit":2000}'
+        );
+
+        List<AiSalesAssistantController.SemanticOverride> overrides =
+            AiSalesAssistantController.detectOverrides('GP for scaleups');
+
+        String error = AiSalesAssistantController.checkForbiddenFields(plan, overrides);
+        System.assertEquals(null, error, 'Correctly formed plan should pass');
+
+        AiSalesAssistantController.testRegistryOverride = null;
+    }
+
+    @isTest
+    static void testApplyOverridesToPlan_MENAMultiValue() {
+        AiSalesAssistantController.testRegistryOverride = buildTestRegistry();
+
+        Map<String, Object> plan = (Map<String, Object>) JSON.deserializeUntyped(
+            '{"domain":"revenue","intent":"aggregate","object":"accounts_revenue__c",' +
+            '"measures":[{"fn":"SUM","field":"Revenue_Booked_Amount__c","alias":"rev"}],' +
+            '"dimensions":["Cluster__c","Currency__c"],' +
+            '"filters":[],' +
+            '"dateFilter":{"field":"Revenue_Booked_On__c","start":"2025-04-01","end":"2026-03-14"},' +
+            '"sort":{"field":"rev","direction":"DESC"},"limit":2000}'
+        );
+
+        List<AiSalesAssistantController.SemanticOverride> overrides =
+            AiSalesAssistantController.detectOverrides('Total MENA revenue');
+
+        List<String> applied = AiSalesAssistantController.applyOverridesToPlan(plan, overrides);
+        System.assert(applied.contains('cluster_mena'), 'Should have applied MENA override');
+
+        // Check the IN filter was added
+        List<Object> filters = (List<Object>) plan.get('filters');
+        Boolean hasInFilter = false;
+        for (Object fObj : filters) {
+            Map<String, Object> f = (Map<String, Object>) fObj;
+            if ((String) f.get('field') == 'Cluster__c' && (String) f.get('op') == 'IN') {
+                hasInFilter = true;
+            }
+        }
+        System.assertEquals(true, hasInFilter, 'Should have Cluster__c IN filter for MENA');
+
+        AiSalesAssistantController.testRegistryOverride = null;
+    }
 }

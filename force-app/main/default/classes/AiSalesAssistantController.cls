@@ -56,6 +56,11 @@ public with sharing class AiSalesAssistantController {
         'SKU__c values: PF Voice, PF Others, PF Messaging SMS, Enterprise CC, PF Messaging Whatsapp, PF Voice CC, PF Others TC, Conversational AI, Voice Streaming, Chatbot, CQA, Voicebot, PF Messaging Others, PF Messaging RCS, VSIP\n' +
         'Cluster__c values: Africa, APAC, Banking and Insurance, BFSI & Strategic Large, Financial Services, FM Funded-I, FM Funded-II & Traditional-II, Internal, KSA, Marketplace, Mid Market, Mobility, Partnerships, Retail, Romena, Services, SMB, SME Funded, Technology, Traditional-I, UAE, US\n' +
         'Region__c values: International, Scaleup, Domestic Enterprise\n' +
+        'CRITICAL — Region vs Cluster disambiguation:\n' +
+        '  "Scaleup"/"Scaleups"/"Scale" → filter on Region__c = \'Scaleup\', NOT Cluster__c.\n' +
+        '  "Domestic"/"International" → filter on Region__c, NOT Cluster__c.\n' +
+        '  "BFSI"/"Retail"/"APAC"/"SME"/"Technology" etc. → filter on Cluster__c, NOT Region__c.\n' +
+        '  Region__c and Cluster__c have COMPLETELY DIFFERENT value sets. Never confuse them.\n' +
         'Revenue_Classification__c: Recurring, Non-Recurring\n' +
         'Classification__c: New Sales, Cross sell, Up sell, AMC Renewal\n' +
         'Currency__c values: INR, USD, AED\n' +
@@ -423,14 +428,39 @@ public with sharing class AiSalesAssistantController {
                 return pr;
             }
 
+            // Apply semantic overrides BEFORE compilation
+            // Extract the raw user question (strip date context and conversation history)
+            String rawQuestion = enrichedQuestion;
+            if (rawQuestion.contains('[Current question]')) {
+                rawQuestion = rawQuestion.substringAfter('[Current question]');
+            }
+            List<SemanticOverride> overrides = detectOverrides(rawQuestion);
+            List<String> appliedOverrides = new List<String>();
+            if (!overrides.isEmpty()) {
+                // Check for forbidden field violations first
+                String forbiddenError = checkForbiddenFields(plan, overrides);
+                if (forbiddenError != null) {
+                    System.debug('Semantic override correcting forbidden field: ' + forbiddenError);
+                }
+                // Apply corrections to the plan
+                appliedOverrides = applyOverridesToPlan(plan, overrides);
+                for (String oid : appliedOverrides) {
+                    System.debug('SEMANTIC_OVERRIDE_APPLIED: ' + oid + ' (planner path)');
+                }
+            }
+
             // Compile to SOQL
             String soql = compileSoqlFromPlan(plan);
 
             // Return as single-query list (same format as extractAllSoql output)
             PlannerResult pr = new PlannerResult('SUCCESS');
             pr.queries = new List<Map<String, String>>();
+            String label = 'Revenue Query (Structured Planner)';
+            if (!appliedOverrides.isEmpty()) {
+                label += ' [overrides: ' + String.join(appliedOverrides, ',') + ']';
+            }
             pr.queries.add(new Map<String, String>{
-                'label' => 'Revenue Query (Structured Planner)',
+                'label' => label,
                 'soql' => soql
             });
             return pr;
@@ -444,6 +474,276 @@ public with sharing class AiSalesAssistantController {
     }
 
     // ── End Structured Planner ──────────────────────────────────────────
+
+    // ── Revenue Semantic Override Engine ─────────────────────────────────
+    // Deterministic field/value correction layer. Loads a small registry of
+    // high-confidence terms from a static resource and applies corrections
+    // to query plans BEFORE SOQL compilation. Does not replace the planner
+    // or sanitizer — it only overrides specific field→value mappings when
+    // a known term is detected in the user question.
+
+    /**
+     * Represents a single semantic override result — what needs to be corrected.
+     */
+    public class SemanticOverride {
+        public String overrideId;       // e.g. "region_scaleup"
+        public String correctField;     // e.g. "Region__c"
+        public Object correctValue;     // String or List<String> for multi-value (MENA→UAE,KSA)
+        public Set<String> forbiddenFields; // Fields this value must NEVER appear on
+        public String reason;           // Human-readable explanation for logs
+        public String matchedTerm;      // The actual term that triggered the match
+    }
+
+    /**
+     * Loads the registry from the RevenueSemanticRegistry static resource.
+     * Cached after first load. Returns empty list on any load failure.
+     */
+    @TestVisible
+    private static List<Map<String, Object>> testRegistryOverride;
+    private static List<Map<String, Object>> cachedRegistry;
+
+    @TestVisible
+    private static List<Map<String, Object>> loadSemanticRegistry() {
+        if (testRegistryOverride != null) return testRegistryOverride;
+        if (cachedRegistry != null) return cachedRegistry;
+
+        try {
+            StaticResource sr = [SELECT Body FROM StaticResource
+                                 WHERE Name = 'RevenueSemanticRegistry' LIMIT 1];
+            String json_body = sr.Body.toString();
+            Map<String, Object> registry = (Map<String, Object>) JSON.deserializeUntyped(json_body);
+            cachedRegistry = (List<Map<String, Object>>)
+                ((List<Object>) registry.get('overrides'));
+            // Convert inner lists to typed form
+            List<Map<String, Object>> typed = new List<Map<String, Object>>();
+            for (Object o : (List<Object>) registry.get('overrides')) {
+                typed.add((Map<String, Object>) o);
+            }
+            cachedRegistry = typed;
+            return cachedRegistry;
+        } catch (Exception e) {
+            System.debug(LoggingLevel.WARN, 'SemanticRegistry load failed: ' + e.getMessage());
+            cachedRegistry = new List<Map<String, Object>>();
+            return cachedRegistry;
+        }
+    }
+
+    /**
+     * Scans the user question for known terms and returns all matching overrides.
+     * Matching is case-insensitive, whole-word (bounded by spaces/punctuation/start/end).
+     */
+    @TestVisible
+    private static List<SemanticOverride> detectOverrides(String userQuestion) {
+        List<SemanticOverride> results = new List<SemanticOverride>();
+        if (String.isBlank(userQuestion)) return results;
+
+        String questionLower = userQuestion.toLowerCase();
+        List<Map<String, Object>> registry = loadSemanticRegistry();
+
+        for (Map<String, Object> entry : registry) {
+            List<Object> terms = (List<Object>) entry.get('terms');
+            String matched = null;
+
+            for (Object termObj : terms) {
+                String term = ((String) termObj).toLowerCase();
+                // Whole-word match: check if the term appears bounded by non-alpha chars
+                Integer idx = questionLower.indexOf(term);
+                if (idx >= 0) {
+                    Boolean leftBound = (idx == 0) ||
+                        !questionLower.substring(idx - 1, idx).isAlpha();
+                    Boolean rightBound = (idx + term.length() >= questionLower.length()) ||
+                        !questionLower.substring(idx + term.length(), idx + term.length() + 1).isAlpha();
+                    if (leftBound && rightBound) {
+                        matched = (String) termObj;
+                        break;
+                    }
+                }
+            }
+
+            if (matched != null) {
+                SemanticOverride so = new SemanticOverride();
+                so.overrideId = (String) entry.get('id');
+                so.correctField = (String) entry.get('correctField');
+                so.correctValue = entry.get('correctValue');
+                so.reason = (String) entry.get('reason');
+                so.matchedTerm = matched;
+                so.forbiddenFields = new Set<String>();
+                List<Object> forbidden = (List<Object>) entry.get('forbiddenFields');
+                if (forbidden != null) {
+                    for (Object f : forbidden) {
+                        so.forbiddenFields.add(((String) f).toLowerCase());
+                    }
+                }
+                results.add(so);
+            }
+        }
+        return results;
+    }
+
+    /**
+     * Applies semantic overrides to a parsed planner plan (before compilation).
+     * For each override:
+     *   1. Removes any filter on a forbidden field that uses the override's value
+     *   2. Adds/replaces the correct field=value filter
+     *   3. Swaps forbidden dimensions with correct dimension
+     * Returns list of applied override IDs for logging.
+     */
+    @TestVisible
+    private static List<String> applyOverridesToPlan(Map<String, Object> plan,
+                                                      List<SemanticOverride> overrides) {
+        List<String> applied = new List<String>();
+        if (overrides == null || overrides.isEmpty()) return applied;
+
+        List<Object> filters = (List<Object>) plan.get('filters');
+        if (filters == null) {
+            filters = new List<Object>();
+            plan.put('filters', filters);
+        }
+        List<Object> dimensions = (List<Object>) plan.get('dimensions');
+
+        for (SemanticOverride so : overrides) {
+            Boolean didApply = false;
+
+            // 1. Remove any filter on a forbidden field that matches this override's value
+            List<Object> cleanedFilters = new List<Object>();
+            for (Object fObj : filters) {
+                Map<String, Object> f = (Map<String, Object>) fObj;
+                String fField = (String) f.get('field');
+                if (so.forbiddenFields.contains(fField.toLowerCase())) {
+                    // Remove this filter — it's on the wrong field
+                    didApply = true;
+                    continue;
+                }
+                cleanedFilters.add(fObj);
+            }
+            filters = cleanedFilters;
+
+            // 2. Check if correct filter already exists; if not, add it
+            Boolean hasCorrectFilter = false;
+            for (Object fObj : filters) {
+                Map<String, Object> f = (Map<String, Object>) fObj;
+                if (((String) f.get('field')).equalsIgnoreCase(so.correctField)) {
+                    hasCorrectFilter = true;
+                    break;
+                }
+            }
+            if (!hasCorrectFilter) {
+                Map<String, Object> newFilter = new Map<String, Object>();
+                newFilter.put('field', so.correctField);
+                if (so.correctValue instanceof List<Object>) {
+                    newFilter.put('op', 'IN');
+                    newFilter.put('value', so.correctValue);
+                } else {
+                    newFilter.put('op', '=');
+                    newFilter.put('value', so.correctValue);
+                }
+                filters.add(newFilter);
+                didApply = true;
+            }
+
+            // 3. Swap forbidden dimensions with correct dimension
+            if (dimensions != null) {
+                for (Integer i = 0; i < dimensions.size(); i++) {
+                    String dim = (String) dimensions[i];
+                    if (so.forbiddenFields.contains(dim.toLowerCase())) {
+                        dimensions[i] = so.correctField;
+                        didApply = true;
+                    }
+                }
+            }
+
+            plan.put('filters', filters);
+            if (didApply) {
+                applied.add(so.overrideId);
+            }
+        }
+        return applied;
+    }
+
+    /**
+     * Applies semantic overrides to raw SOQL (for legacy prompt path).
+     * Replaces forbidden field references with correct field references.
+     * Returns the corrected SOQL and list of applied override IDs.
+     */
+    @TestVisible
+    private static Map<String, Object> applyOverridesToSoql(String soql,
+                                                             List<SemanticOverride> overrides) {
+        List<String> applied = new List<String>();
+        String correctedSoql = soql;
+
+        for (SemanticOverride so : overrides) {
+            for (String forbidden : so.forbiddenFields) {
+                // Build the wrong filter pattern and replace with correct
+                // e.g. Cluster__c = 'Scaleup' → Region__c = 'Scaleup'
+                String correctVal = (so.correctValue instanceof List<Object>)
+                    ? String.valueOf(so.correctValue) : (String) so.correctValue;
+
+                // Case-insensitive replacement of field name in filter context
+                // Match: forbidden_field (with optional spaces) = 'value'
+                String originalField = forbidden.contains('__c')
+                    ? forbidden : forbidden;
+                // Get the actual casing from SOQL by searching case-insensitively
+                String soqlLower = correctedSoql.toLowerCase();
+                Integer fieldIdx = soqlLower.indexOf(forbidden);
+                if (fieldIdx >= 0) {
+                    // Found the forbidden field — extract actual casing from SOQL
+                    String actualField = correctedSoql.substring(fieldIdx, fieldIdx + forbidden.length());
+                    // Replace field name with correct field
+                    correctedSoql = correctedSoql.replace(actualField, so.correctField);
+                    applied.add(so.overrideId);
+                }
+            }
+        }
+
+        return new Map<String, Object>{
+            'soql' => correctedSoql,
+            'applied' => applied
+        };
+    }
+
+    /**
+     * Checks a planner plan for forbidden field violations.
+     * Returns an error string if any filter uses a forbidden field for a detected override,
+     * or null if the plan is clean.
+     */
+    @TestVisible
+    private static String checkForbiddenFields(Map<String, Object> plan,
+                                                List<SemanticOverride> overrides) {
+        if (overrides == null || overrides.isEmpty()) return null;
+
+        List<Object> filters = (List<Object>) plan.get('filters');
+        if (filters == null) return null;
+
+        for (Object fObj : filters) {
+            Map<String, Object> f = (Map<String, Object>) fObj;
+            String fField = ((String) f.get('field')).toLowerCase();
+            for (SemanticOverride so : overrides) {
+                if (so.forbiddenFields.contains(fField)) {
+                    return 'Forbidden field ' + f.get('field') + ' used for term "' +
+                        so.matchedTerm + '". Must use ' + so.correctField +
+                        '. (' + so.reason + ')';
+                }
+            }
+        }
+
+        // Also check dimensions
+        List<Object> dimensions = (List<Object>) plan.get('dimensions');
+        if (dimensions != null) {
+            for (Object dObj : dimensions) {
+                String dim = ((String) dObj).toLowerCase();
+                for (SemanticOverride so : overrides) {
+                    if (so.forbiddenFields.contains(dim)) {
+                        return 'Forbidden dimension ' + dObj + ' for term "' +
+                            so.matchedTerm + '". Must use ' + so.correctField +
+                            '. (' + so.reason + ')';
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    // ── End Revenue Semantic Override Engine ─────────────────────────────
 
     private static final String SOQL_SYSTEM_PROMPT =
         'You are a Salesforce SOQL generator for Exotel/Ameyo\'s org. Convert natural language to SOQL.\n\n' +
@@ -641,7 +941,15 @@ public with sharing class AiSalesAssistantController {
         '    4. Remaining ~5% gap is due to currency rate differences (Tableau uses USD=85, SF formula varies)\n\n' +
         'DEFAULT: Use accounts_revenue__c for revenue questions unless user\n' +
         '  specifically asks about deals/bookings/pipeline/opportunities.\n' +
-        'SECTOR queries: Use Cluster__c on accounts_revenue__c, or Account_Cluster__c on Opportunity.\n\n' +
+        'SECTOR queries: Use Cluster__c on accounts_revenue__c, or Account_Cluster__c on Opportunity.\n' +
+        '⚠️ REGION vs CLUSTER DISAMBIGUATION (critical — gets confused often):\n' +
+        '  Region__c has ONLY 3 values: International, Scaleup, Domestic Enterprise.\n' +
+        '  Cluster__c has 22 values: BFSI, SME Funded, Technology, Retail, APAC, UAE, etc.\n' +
+        '  "Scaleup"/"Scaleups"/"Scale" → ALWAYS filter Region__c = \'Scaleup\', NEVER Cluster__c.\n' +
+        '  "Domestic"/"Dom" → ALWAYS filter Region__c = \'Domestic Enterprise\', NEVER Cluster__c.\n' +
+        '  "International"/"Intl" → ALWAYS filter Region__c = \'International\', NEVER Cluster__c.\n' +
+        '  "BFSI"/"Retail"/"APAC"/"SME"/"Technology"/etc. → filter Cluster__c, NEVER Region__c.\n' +
+        '  RULE: If the user\'s term matches a Region__c value, use Region__c. If it matches a Cluster__c value, use Cluster__c. Never swap them.\n\n' +
         '=== OPPORTUNITY (341 fields) ===\n' +
         'Standard: Id, Name, AccountId, OwnerId, StageName, Amount, CloseDate, CreatedDate,\n' +
         '  LastModifiedDate, IsClosed, IsWon, Probability, Type, LeadSource, Description,\n' +
@@ -1313,6 +1621,23 @@ public with sharing class AiSalesAssistantController {
 
                 // Step 2: Extract ALL SOQL queries (supports 1-5 labeled queries)
                 queries = SoqlSanitizer.extractAllSoql(soqlResponse.content);
+
+                // Step 2.5: Apply semantic overrides to legacy-path SOQL
+                List<SemanticOverride> legacyOverrides = detectOverrides(userQuestion);
+                if (!legacyOverrides.isEmpty()) {
+                    for (Integer qi = 0; qi < queries.size(); qi++) {
+                        Map<String, String> q = queries[qi];
+                        Map<String, Object> overrideResult =
+                            applyOverridesToSoql(q.get('soql'), legacyOverrides);
+                        List<String> appliedIds = (List<String>) overrideResult.get('applied');
+                        if (!appliedIds.isEmpty()) {
+                            q.put('soql', (String) overrideResult.get('soql'));
+                            for (String oid : appliedIds) {
+                                System.debug('SEMANTIC_OVERRIDE_APPLIED: ' + oid + ' (legacy path, query ' + qi + ')');
+                            }
+                        }
+                    }
+                }
             }
 
             initialSoql = queries[0].get('soql');

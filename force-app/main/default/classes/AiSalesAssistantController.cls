@@ -745,6 +745,585 @@ public with sharing class AiSalesAssistantController {
 
     // ── End Revenue Semantic Override Engine ─────────────────────────────
 
+    // ── KPI Deterministic Engine ──────────────────────────────────────────
+    // Executes known KPIs (Win Rate, Conversion Rate, Sales Cycle) using
+    // deterministic Apex-compiled queries + formulas. No Claude involvement
+    // for query generation — Claude only explains the pre-computed results.
+    // Registry is loaded from KpiRegistry static resource.
+
+    /**
+     * Result of KPI engine execution.
+     */
+    public class KpiResult {
+        public String kpiId;
+        public String kpiLabel;
+        public String dimension;          // actual SF field used for grouping
+        public String timeRange;          // e.g. "FY2025 (Apr 2025 - Mar 2026)"
+        public List<String> soqlQueries;  // deterministic queries executed
+        public String resultsJson;        // pre-formatted JSON for Claude summary
+        public Integer totalRecords;
+    }
+
+    /**
+     * A single row of KPI output for a grouped dimension.
+     */
+    private class KpiRow {
+        String groupValue;
+        Decimal numerator;
+        Decimal denominator;
+        Integer numeratorCount;
+        Integer denominatorCount;
+        Decimal value;       // computed ratio or avg
+        Decimal valueByCount; // count-based ratio (for win rate)
+    }
+
+    // KPI summary prompt — focused: explain pre-computed results, do NOT recompute
+    private static final String KPI_SUMMARY_PROMPT =
+        'You are a business analyst at Exotel/Ameyo presenting KPI results to leadership.\n' +
+        'The KPI values below were computed deterministically (Tableau-validated formulas). DO NOT recompute them.\n\n' +
+        'RULES:\n' +
+        '- Use the EXACT numbers provided. Never divide, multiply, or re-derive.\n' +
+        '- Format currency: below ₹100L use Lakhs (₹XX.XX L), above ₹100L use Crores (₹X.XX Cr).\n' +
+        '- Highlight top 3 performers with 🟢 and bottom 3 with 🔴.\n' +
+        '- For win/conversion rates: explain what the gap between value-based and count-based rates reveals.\n' +
+        '  Large gap (value < count) = winning small deals, losing large ones.\n' +
+        '  Small gap or reversed = deal sizes are balanced or winning large deals.\n' +
+        '- For sales cycle: below 30 days is fast, 30-60 is normal, 60-90 is slow, above 90 is concerning.\n' +
+        '- Present the overall summary table first, then the dimensional breakdown, then key insights.\n' +
+        '- Keep insights concise and actionable (max 5 bullet points).\n' +
+        '- Use markdown tables for the breakdown.\n' +
+        'QUARTER DEFINITIONS: Q1=Apr-Jun, Q2=Jul-Sep, Q3=Oct-Dec, Q4=Jan-Mar. FY runs April to March.\n';
+
+    // Cached KPI registry
+    @TestVisible
+    private static List<Map<String, Object>> testKpiRegistryOverride;
+    private static List<Map<String, Object>> cachedKpiRegistry;
+
+    /**
+     * Loads the KPI registry from KpiRegistry static resource. Cached after first load.
+     */
+    @TestVisible
+    private static List<Map<String, Object>> loadKpiRegistry() {
+        if (testKpiRegistryOverride != null) return testKpiRegistryOverride;
+        if (cachedKpiRegistry != null) return cachedKpiRegistry;
+        try {
+            StaticResource sr = [SELECT Body FROM StaticResource
+                                 WHERE Name = 'KpiRegistry' LIMIT 1];
+            Map<String, Object> registry = (Map<String, Object>) JSON.deserializeUntyped(sr.Body.toString());
+            cachedKpiRegistry = new List<Map<String, Object>>();
+            for (Object o : (List<Object>) registry.get('kpis')) {
+                cachedKpiRegistry.add((Map<String, Object>) o);
+            }
+            return cachedKpiRegistry;
+        } catch (Exception e) {
+            System.debug(LoggingLevel.WARN, 'KpiRegistry load failed: ' + e.getMessage());
+            cachedKpiRegistry = new List<Map<String, Object>>();
+            return cachedKpiRegistry;
+        }
+    }
+
+    /**
+     * Detects if the user question matches a known KPI.
+     * Uses whole-word matching (same pattern as semantic override detection).
+     * Returns the KPI definition map, or null if no match.
+     */
+    @TestVisible
+    private static Map<String, Object> detectKpiIntent(String userQuestion) {
+        if (String.isBlank(userQuestion)) return null;
+        String lower = userQuestion.toLowerCase();
+        List<Map<String, Object>> registry = loadKpiRegistry();
+
+        Map<String, Object> bestMatch = null;
+        Integer bestTermLength = 0;
+
+        for (Map<String, Object> kpi : registry) {
+            List<Object> terms = (List<Object>) kpi.get('questionTerms');
+            for (Object termObj : terms) {
+                String term = ((String) termObj).toLowerCase();
+                // Whole-word boundary match (same approach as semantic override detection)
+                Integer idx = lower.indexOf(term);
+                if (idx >= 0) {
+                    Boolean leftBound = (idx == 0) ||
+                        !lower.substring(idx - 1, idx).isAlpha();
+                    Boolean rightBound = (idx + term.length() >= lower.length()) ||
+                        !lower.substring(idx + term.length(), idx + term.length() + 1).isAlpha();
+                    if (leftBound && rightBound) {
+                        // Prefer longest matching term (more specific)
+                        if (term.length() > bestTermLength) {
+                            bestTermLength = term.length();
+                            bestMatch = kpi;
+                        }
+                    }
+                }
+            }
+        }
+        return bestMatch;
+    }
+
+    /**
+     * Extracts the grouping dimension from the user question.
+     * Matches against supportedDimensions keys from the KPI definition.
+     * Returns the SF field name, or the defaultDimension if no match.
+     */
+    @TestVisible
+    private static String extractKpiGrouping(String userQuestion, Map<String, Object> kpiDef) {
+        String lower = userQuestion.toLowerCase();
+        String defaultDim = (String) kpiDef.get('defaultDimension');
+        Map<String, Object> supported = (Map<String, Object>) kpiDef.get('supportedDimensions');
+        if (supported == null) return defaultDim;
+
+        // Check each dimension keyword (longest match first)
+        String bestField = null;
+        Integer bestLen = 0;
+        for (String keyword : supported.keySet()) {
+            if (lower.contains(keyword.toLowerCase()) && keyword.length() > bestLen) {
+                bestField = (String) supported.get(keyword);
+                bestLen = keyword.length();
+            }
+        }
+        return bestField != null ? bestField : defaultDim;
+    }
+
+    /**
+     * Extracts time range from user question. Returns {start, end, label}.
+     * Handles: FY, quarter, month, and explicit date references.
+     */
+    @TestVisible
+    private static Map<String, Object> extractKpiTimeRange(String userQuestion, Date today) {
+        String lower = userQuestion.toLowerCase();
+        Integer fyStartYear = today.month() >= 4 ? today.year() : today.year() - 1;
+        Date fyStart = Date.newInstance(fyStartYear, 4, 1);
+
+        Map<String, Object> result = new Map<String, Object>();
+
+        // Check for "last quarter" / "previous quarter"
+        if (lower.contains('last quarter') || lower.contains('previous quarter') || lower.contains('prev quarter')) {
+            // Go back one quarter from current
+            Integer currentQ;
+            if (today.month() >= 4 && today.month() <= 6) currentQ = 1;
+            else if (today.month() >= 7 && today.month() <= 9) currentQ = 2;
+            else if (today.month() >= 10 && today.month() <= 12) currentQ = 3;
+            else currentQ = 4;
+
+            Integer prevQ = currentQ == 1 ? 4 : currentQ - 1;
+            Integer prevYear = (currentQ == 1) ? fyStartYear - 1 : fyStartYear;
+            Date qStart;
+            Date qEnd;
+            if (prevQ == 1) { qStart = Date.newInstance(prevYear, 4, 1); qEnd = Date.newInstance(prevYear, 6, 30); }
+            else if (prevQ == 2) { qStart = Date.newInstance(prevYear, 7, 1); qEnd = Date.newInstance(prevYear, 9, 30); }
+            else if (prevQ == 3) { qStart = Date.newInstance(prevYear, 10, 1); qEnd = Date.newInstance(prevYear, 12, 31); }
+            else { qStart = Date.newInstance(prevYear + 1, 1, 1); qEnd = Date.newInstance(prevYear + 1, 3, 31); }
+
+            result.put('start', qStart);
+            result.put('end', qEnd);
+            result.put('label', 'Q' + prevQ + ' FY' + prevYear);
+            return result;
+        }
+
+        // Check for specific quarter: "Q1", "Q2", "Q3", "Q4", "this quarter"
+        if (lower.contains('this quarter') || lower.contains('current quarter')) {
+            Integer currentQ;
+            if (today.month() >= 4 && today.month() <= 6) currentQ = 1;
+            else if (today.month() >= 7 && today.month() <= 9) currentQ = 2;
+            else if (today.month() >= 10 && today.month() <= 12) currentQ = 3;
+            else currentQ = 4;
+
+            Date qStart;
+            Date qEnd;
+            if (currentQ == 1) { qStart = Date.newInstance(fyStartYear, 4, 1); qEnd = Date.newInstance(fyStartYear, 6, 30); }
+            else if (currentQ == 2) { qStart = Date.newInstance(fyStartYear, 7, 1); qEnd = Date.newInstance(fyStartYear, 9, 30); }
+            else if (currentQ == 3) { qStart = Date.newInstance(fyStartYear, 10, 1); qEnd = Date.newInstance(fyStartYear, 12, 31); }
+            else { qStart = Date.newInstance(fyStartYear + 1, 1, 1); qEnd = Date.newInstance(fyStartYear + 1, 3, 31); }
+
+            result.put('start', qStart);
+            result.put('end', qEnd);
+            result.put('label', 'Q' + currentQ + ' FY' + fyStartYear);
+            return result;
+        }
+
+        // Check for "this month" / "current month"
+        if (lower.contains('this month') || lower.contains('current month')) {
+            Date mStart = Date.newInstance(today.year(), today.month(), 1);
+            result.put('start', mStart);
+            result.put('end', today);
+            result.put('label', mStart.format().substring(0, 7));
+            return result;
+        }
+
+        // Check for "last month" / "previous month"
+        if (lower.contains('last month') || lower.contains('previous month')) {
+            Date prevMonthStart = Date.newInstance(today.year(), today.month(), 1).addMonths(-1);
+            Date prevMonthEnd = Date.newInstance(today.year(), today.month(), 1).addDays(-1);
+            result.put('start', prevMonthStart);
+            result.put('end', prevMonthEnd);
+            result.put('label', prevMonthStart.format().substring(0, 7));
+            return result;
+        }
+
+        // Default: current FY — use full FY end (Mar 31), NOT today.
+        // Tableau/CRM Buddy use complete FY boundaries. Consumed pipeline includes
+        // deals with future CloseDate within FY. Won (B_Deal_Date) won't have future dates,
+        // so extending to Mar 31 doesn't inflate the numerator.
+        Date fyEnd = Date.newInstance(fyStartYear + 1, 3, 31);
+        result.put('start', fyStart);
+        result.put('end', fyEnd);
+        result.put('label', 'FY' + fyStartYear + ' (Apr ' + fyStartYear + ' - Mar ' + (fyStartYear + 1) + ')');
+        return result;
+    }
+
+    /**
+     * Builds a deterministic aggregate SOQL query from KPI spec.
+     */
+    private static String buildKpiAggregateQuery(
+        Map<String, Object> spec, String dimension, Date startDate, Date endDate
+    ) {
+        String measureField = (String) spec.get('measureField');
+        String measureFn = (String) spec.get('measureFn');
+        String countField = (String) spec.get('countField');
+        String dateField = (String) spec.get('dateField');
+        List<Object> stageFilter = (List<Object>) spec.get('stageFilter');
+
+        // Build stage IN clause
+        List<String> stageStrs = new List<String>();
+        for (Object s : stageFilter) {
+            stageStrs.add('\'' + String.escapeSingleQuotes((String) s) + '\'');
+        }
+
+        // No Amount > 0 filter — let SUM handle nulls naturally.
+        // Including zero/negative amounts (reversals) matches Tableau's denominator.
+        String soql = 'SELECT ' + dimension + ', ' +
+            measureFn + '(' + measureField + ') val, COUNT(' + countField + ') cnt' +
+            ' FROM Opportunity WHERE StageName IN (' + String.join(stageStrs, ',') + ')' +
+            ' AND ' + dateField + ' >= ' + String.valueOf(startDate) +
+            ' AND ' + dateField + ' <= ' + String.valueOf(endDate) +
+            ' GROUP BY ' + dimension +
+            ' ORDER BY ' + measureFn + '(' + measureField + ') DESC' +
+            ' LIMIT 2000';
+        return soql;
+    }
+
+    /**
+     * Builds a detail query for sales cycle computation (avg or median).
+     */
+    private static String buildSalesCycleDetailQuery(
+        Map<String, Object> computation, String dimension, Date startDate, Date endDate, Integer rowLimit
+    ) {
+        String startDateField = (String) computation.get('startDateField');
+        String endDateField = (String) computation.get('endDateField');
+        List<Object> stageFilter = (List<Object>) computation.get('stageFilter');
+
+        List<String> stageStrs = new List<String>();
+        for (Object s : stageFilter) {
+            stageStrs.add('\'' + String.escapeSingleQuotes((String) s) + '\'');
+        }
+
+        String soql = 'SELECT ' + dimension + ', ' + startDateField + ', ' + endDateField +
+            ' FROM Opportunity WHERE StageName IN (' + String.join(stageStrs, ',') + ')' +
+            ' AND ' + startDateField + ' != null' +
+            ' AND ' + endDateField + ' != null' +
+            ' AND ' + endDateField + ' >= ' + String.valueOf(startDate) +
+            ' AND ' + endDateField + ' <= ' + String.valueOf(endDate) +
+            ' ORDER BY ' + dimension +
+            ' LIMIT ' + rowLimit;
+        return soql;
+    }
+
+    /**
+     * Main KPI orchestrator. Detects KPI, compiles queries, executes, computes formula.
+     * Returns null if no KPI detected (fall through to existing flow).
+     */
+    @TestVisible
+    private static KpiResult runKpiEngine(String userQuestion, Date today) {
+        // Step 1: Detect KPI intent
+        Map<String, Object> kpiDef = detectKpiIntent(userQuestion);
+        if (kpiDef == null) return null;
+
+        String kpiId = (String) kpiDef.get('id');
+        String displayName = (String) kpiDef.get('displayName');
+        String formulaType = (String) kpiDef.get('formulaType');
+
+        System.debug('KPI_ENGINE: Detected ' + kpiId + ' (' + displayName + ')');
+
+        // Step 2: Extract grouping and time range
+        String dimension = extractKpiGrouping(userQuestion, kpiDef);
+        Map<String, Object> timeRange = extractKpiTimeRange(userQuestion, today);
+        Date startDate = (Date) timeRange.get('start');
+        Date endDate = (Date) timeRange.get('end');
+        String timeLabel = (String) timeRange.get('label');
+
+        System.debug('KPI_ENGINE: dimension=' + dimension + ' timeRange=' + timeLabel);
+
+        KpiResult result = new KpiResult();
+        result.kpiId = kpiId;
+        result.kpiLabel = displayName + ' — ' + timeLabel;
+        result.dimension = dimension;
+        result.timeRange = timeLabel;
+        result.soqlQueries = new List<String>();
+
+        if (formulaType == 'RATIO') {
+            // WIN_RATE or CONVERSION_RATE: two-query ratio
+            Map<String, Object> numSpec = (Map<String, Object>) kpiDef.get('numerator');
+            Map<String, Object> denSpec = (Map<String, Object>) kpiDef.get('denominator');
+
+            String numSoql = buildKpiAggregateQuery(numSpec, dimension, startDate, endDate);
+            String denSoql = buildKpiAggregateQuery(denSpec, dimension, startDate, endDate);
+            result.soqlQueries.add(numSoql);
+            result.soqlQueries.add(denSoql);
+
+            System.debug('KPI_ENGINE: numerator SOQL = ' + numSoql);
+            System.debug('KPI_ENGINE: denominator SOQL = ' + denSoql);
+
+            // Execute both queries
+            List<SObject> numRecords = Database.query(numSoql);
+            List<SObject> denRecords = Database.query(denSoql);
+            result.totalRecords = numRecords.size() + denRecords.size();
+
+            // Build maps by dimension
+            Map<String, Decimal> numValMap = new Map<String, Decimal>();
+            Map<String, Integer> numCntMap = new Map<String, Integer>();
+            for (SObject rec : numRecords) {
+                String dimVal = String.valueOf(rec.get(dimension));
+                numValMap.put(dimVal, (Decimal) rec.get('val'));
+                numCntMap.put(dimVal, (Integer) rec.get('cnt'));
+            }
+
+            Map<String, Decimal> denValMap = new Map<String, Decimal>();
+            Map<String, Integer> denCntMap = new Map<String, Integer>();
+            for (SObject rec : denRecords) {
+                String dimVal = String.valueOf(rec.get(dimension));
+                denValMap.put(dimVal, (Decimal) rec.get('val'));
+                denCntMap.put(dimVal, (Integer) rec.get('cnt'));
+            }
+
+            // Compute ratios per dimension
+            List<KpiRow> rows = new List<KpiRow>();
+            Decimal grandNum = 0, grandDen = 0;
+            Integer grandNumCnt = 0, grandDenCnt = 0;
+            Set<String> allDims = new Set<String>();
+            allDims.addAll(numValMap.keySet());
+            allDims.addAll(denValMap.keySet());
+
+            for (String dimVal : allDims) {
+                KpiRow row = new KpiRow();
+                row.groupValue = dimVal;
+                row.numerator = numValMap.containsKey(dimVal) ? numValMap.get(dimVal) : 0;
+                row.denominator = denValMap.containsKey(dimVal) ? denValMap.get(dimVal) : 0;
+                row.numeratorCount = numCntMap.containsKey(dimVal) ? numCntMap.get(dimVal) : 0;
+                row.denominatorCount = denCntMap.containsKey(dimVal) ? denCntMap.get(dimVal) : 0;
+                row.value = row.denominator > 0 ?
+                    (row.numerator / row.denominator * 100).setScale(1, RoundingMode.HALF_UP) : 0;
+                row.valueByCount = row.denominatorCount > 0 ?
+                    (Decimal.valueOf(row.numeratorCount) / Decimal.valueOf(row.denominatorCount) * 100).setScale(1, RoundingMode.HALF_UP) : 0;
+                rows.add(row);
+                grandNum += row.numerator;
+                grandDen += row.denominator;
+                grandNumCnt += row.numeratorCount;
+                grandDenCnt += row.denominatorCount;
+            }
+
+            Decimal overallValue = grandDen > 0 ?
+                (grandNum / grandDen * 100).setScale(2, RoundingMode.HALF_UP) : 0;
+            Decimal overallCount = grandDenCnt > 0 ?
+                (Decimal.valueOf(grandNumCnt) / Decimal.valueOf(grandDenCnt) * 100).setScale(2, RoundingMode.HALF_UP) : 0;
+
+            // Sort rows by denominator value DESC (largest pipeline first)
+            // Simple insertion sort (OK for <50 rows)
+            for (Integer i = 1; i < rows.size(); i++) {
+                KpiRow key = rows[i];
+                Integer j = i - 1;
+                while (j >= 0 && rows[j].denominator < key.denominator) {
+                    rows[j + 1] = rows[j];
+                    j--;
+                }
+                rows[j + 1] = key;
+            }
+
+            // Build results JSON
+            Boolean showBoth = kpiDef.get('showBothValueAndCount') == true;
+            String note = (String) kpiDef.get('interpretationNote');
+            result.resultsJson = buildRatioResultsJson(
+                kpiId, displayName, timeLabel, dimension, note,
+                rows, overallValue, overallCount, grandNum, grandDen, grandNumCnt, grandDenCnt, showBoth);
+
+        } else if (formulaType == 'AVERAGE' || formulaType == 'MEDIAN') {
+            // SALES_CYCLE_AVG or SALES_CYCLE_MEDIAN
+            Map<String, Object> computation = (Map<String, Object>) kpiDef.get('computation');
+            String startDateField = (String) computation.get('startDateField');
+            String endDateField = (String) computation.get('endDateField');
+            Integer maxRows = computation.get('maxDetailRows') != null ?
+                ((Integer) computation.get('maxDetailRows')) : 10000;
+
+            String detailSoql = buildSalesCycleDetailQuery(
+                computation, dimension, startDate, endDate, maxRows);
+            result.soqlQueries.add(detailSoql);
+
+            System.debug('KPI_ENGINE: detail SOQL = ' + detailSoql);
+
+            // Execute detail query
+            List<SObject> records = Database.query(detailSoql);
+            result.totalRecords = records.size();
+
+            // Group by dimension, compute days
+            Map<String, List<Integer>> daysByDim = new Map<String, List<Integer>>();
+            for (SObject rec : records) {
+                String dimVal = String.valueOf(rec.get(dimension));
+                Date sDate = (Date) rec.get(startDateField);
+                Date eDate = (Date) rec.get(endDateField);
+                if (sDate == null || eDate == null) continue;
+                Integer days = sDate.daysBetween(eDate);
+                if (days < 0) continue; // skip invalid
+                if (!daysByDim.containsKey(dimVal)) {
+                    daysByDim.put(dimVal, new List<Integer>());
+                }
+                daysByDim.get(dimVal).add(days);
+            }
+
+            // Compute avg or median per dimension
+            List<KpiRow> rows = new List<KpiRow>();
+            List<Integer> allDays = new List<Integer>();
+            for (String dimVal : daysByDim.keySet()) {
+                List<Integer> vals = daysByDim.get(dimVal);
+                vals.sort();
+                allDays.addAll(vals);
+
+                KpiRow row = new KpiRow();
+                row.groupValue = dimVal;
+                row.denominatorCount = vals.size();
+
+                if (formulaType == 'AVERAGE') {
+                    Decimal sum = 0;
+                    for (Integer d : vals) sum += d;
+                    row.value = vals.size() > 0 ? (sum / vals.size()).setScale(1, RoundingMode.HALF_UP) : 0;
+                } else {
+                    // MEDIAN
+                    row.value = computeMedian(vals);
+                }
+                rows.add(row);
+            }
+
+            // Sort by value ASC (fastest first)
+            for (Integer i = 1; i < rows.size(); i++) {
+                KpiRow key = rows[i];
+                Integer j = i - 1;
+                while (j >= 0 && rows[j].value > key.value) {
+                    rows[j + 1] = rows[j];
+                    j--;
+                }
+                rows[j + 1] = key;
+            }
+
+            // Overall
+            allDays.sort();
+            Decimal overallValue;
+            if (formulaType == 'AVERAGE') {
+                Decimal totalSum = 0;
+                for (Integer d : allDays) totalSum += d;
+                overallValue = allDays.size() > 0 ? (totalSum / allDays.size()).setScale(1, RoundingMode.HALF_UP) : 0;
+            } else {
+                overallValue = computeMedian(allDays);
+            }
+
+            String note = (String) kpiDef.get('interpretationNote');
+            result.resultsJson = buildCycleResultsJson(
+                kpiId, displayName, formulaType, timeLabel, dimension, note,
+                rows, overallValue, allDays.size());
+        }
+
+        System.debug('KPI_ENGINE: execution complete for ' + kpiId);
+        return result;
+    }
+
+    /**
+     * Computes median from a pre-sorted list of integers.
+     */
+    @TestVisible
+    private static Decimal computeMedian(List<Integer> sortedVals) {
+        if (sortedVals == null || sortedVals.isEmpty()) return 0;
+        Integer n = sortedVals.size();
+        if (Math.mod(n, 2) == 1) {
+            return Decimal.valueOf(sortedVals[n / 2]);
+        } else {
+            return (Decimal.valueOf(sortedVals[n / 2 - 1]) + Decimal.valueOf(sortedVals[n / 2])) / 2;
+        }
+    }
+
+    /**
+     * Computes simple ratio, handling divide-by-zero.
+     */
+    @TestVisible
+    private static Decimal computeRatio(Decimal numerator, Decimal denominator) {
+        if (denominator == null || denominator == 0) return 0;
+        return (numerator / denominator * 100).setScale(2, RoundingMode.HALF_UP);
+    }
+
+    /**
+     * Builds results JSON for ratio KPIs (Win Rate, Conversion Rate).
+     */
+    private static String buildRatioResultsJson(
+        String kpiId, String displayName, String timeLabel, String dimension, String note,
+        List<KpiRow> rows, Decimal overallValue, Decimal overallCount,
+        Decimal grandNum, Decimal grandDen, Integer grandNumCnt, Integer grandDenCnt,
+        Boolean showBoth
+    ) {
+        // Build JSON manually for control over structure
+        String json = '{"kpi":"' + kpiId + '","displayName":"' + displayName + '",' +
+            '"period":"' + timeLabel + '","dimension":"' + dimension + '",' +
+            '"interpretationNote":"' + (note != null ? note : '') + '",' +
+            '"overall":{' +
+                '"rateByValue":' + overallValue + ',' +
+                '"rateByCount":' + overallCount + ',' +
+                '"numeratorValue":' + grandNum + ',' +
+                '"numeratorValue_display":"' + formatAsLakhs(grandNum) + '",' +
+                '"denominatorValue":' + grandDen + ',' +
+                '"denominatorValue_display":"' + formatAsLakhs(grandDen) + '",' +
+                '"numeratorCount":' + grandNumCnt + ',' +
+                '"denominatorCount":' + grandDenCnt +
+            '},"rows":[';
+
+        List<String> rowJsons = new List<String>();
+        for (KpiRow row : rows) {
+            String rj = '{"group":"' + (row.groupValue != null ? String.escapeSingleQuotes(row.groupValue) : 'null') + '",' +
+                '"numeratorValue":' + row.numerator + ',' +
+                '"numeratorValue_display":"' + formatAsLakhs(row.numerator) + '",' +
+                '"denominatorValue":' + row.denominator + ',' +
+                '"denominatorValue_display":"' + formatAsLakhs(row.denominator) + '",' +
+                '"rateByValue":' + row.value + ',' +
+                '"numeratorCount":' + row.numeratorCount + ',' +
+                '"denominatorCount":' + row.denominatorCount + ',' +
+                '"rateByCount":' + row.valueByCount + '}';
+            rowJsons.add(rj);
+        }
+        json += String.join(rowJsons, ',') + ']}';
+        return json;
+    }
+
+    /**
+     * Builds results JSON for sales cycle KPIs.
+     */
+    private static String buildCycleResultsJson(
+        String kpiId, String displayName, String formulaType, String timeLabel,
+        String dimension, String note,
+        List<KpiRow> rows, Decimal overallValue, Integer totalDeals
+    ) {
+        String json = '{"kpi":"' + kpiId + '","displayName":"' + displayName + '",' +
+            '"formulaType":"' + formulaType + '",' +
+            '"period":"' + timeLabel + '","dimension":"' + dimension + '",' +
+            '"interpretationNote":"' + (note != null ? note : '') + '",' +
+            '"overall":{"value":' + overallValue + ',"unit":"days","totalDeals":' + totalDeals + '},' +
+            '"rows":[';
+
+        List<String> rowJsons = new List<String>();
+        for (KpiRow row : rows) {
+            String rj = '{"group":"' + (row.groupValue != null ? String.escapeSingleQuotes(row.groupValue) : 'null') + '",' +
+                '"value":' + row.value + ',"dealCount":' + row.denominatorCount + '}';
+            rowJsons.add(rj);
+        }
+        json += String.join(rowJsons, ',') + ']}';
+        return json;
+    }
+
+    // ── End KPI Deterministic Engine ──────────────────────────────────────
+
     private static final String SOQL_SYSTEM_PROMPT =
         'You are a Salesforce SOQL generator for Exotel/Ameyo\'s org. Convert natural language to SOQL.\n\n' +
         '=== RULES ===\n' +
@@ -772,37 +1351,71 @@ public with sharing class AiSalesAssistantController {
         '  NEVER interpret "this year" as calendar year (Jan-Dec). India runs on fiscal year.\n\n' +
         '=== COMPUTED METRICS (require specific SOQL patterns) ===\n' +
         'WIN RATE: "win rate"/"conversion rate"/"success rate" across any dimension.\n' +
-        '  Definition: Won value / Total consumed value (consumed = won + all lost/closed stages).\n' +
+        '  Definition (Tableau-validated, Key KPIs dashboard): Won value / Total consumed value.\n' +
         '  Won stage: StageName = \'Order\'\n' +
-        '  Consumed (terminal) stages: StageName IN (\'Order\',\'Closed Lost\',\'Closed-No decision\',\'Closed Unknown\',\'Closed Duplicate\',\'Rejected\',\'SDF Rejected\')\n' +
+        '  Won date field: B_Deal_Date__c (booking date, NOT CloseDate)\n' +
+        '  Consumed stages: Terminal stages PLUS Negotiation (deals that reached pricing/terms stage):\n' +
+        '    StageName IN (\'Order\',\'Negotiation\',\'Closed Lost\',\'Closed-No decision\',\'Closed Unknown\',\'Closed Duplicate\',\'Rejected\',\'SDF Rejected\')\n' +
+        '  Consumed date field: CloseDate\n' +
+        '  Value field: Amount for BOTH won and consumed. NOT Net_New_INR__c (it is 0 for lost deals).\n' +
         '  CRITICAL: You MUST include StageName in both SELECT and GROUP BY so the summary can split won vs total.\n' +
-        '  Value field: Use Net_New_INR__c for won-side value. BUT Net_New_INR__c is NULL/0 for lost deals.\n' +
-        '    So for win rate denominator, use Amount (native currency). The summary step will compute the ratio.\n' +
-        '  Example: SELECT Account_Cluster__c, StageName, SUM(Amount) val, COUNT(Id) cnt\n' +
-        '    FROM Opportunity WHERE StageName IN (\'Order\',\'Closed Lost\',\'Closed-No decision\',\'Closed Unknown\',\'Closed Duplicate\',\'Rejected\',\'SDF Rejected\')\n' +
-        '    AND CloseDate >= 2025-04-01 AND CloseDate <= 2026-03-31\n' +
-        '    GROUP BY Account_Cluster__c, StageName ORDER BY Account_Cluster__c LIMIT 2000\n' +
-        '  The summary step will then: won = rows where StageName=Order, total = all rows per cluster → win rate = won/total.\n' +
-        'PIPELINE: "pipeline"/"funnel"/"open deals"/"active opportunities"\n' +
-        '  Pipeline/Funnel = all currently OPEN deals (CRM Buddy definition — excludes Suspect):\n' +
-        '    StageName IN (\'Approach\',\'Prospect\',\'Proposal\',\'Negotiation\',\'SDF Submission\',\'POC\',\'On Hold\',\'Closed won - Pending\')\n' +
-        '  NOTE: Suspect is NOT pipeline — it is pre-qualification. Only include Suspect if user explicitly asks for "suspects" or "all stages".\n' +
-        '  TOTAL FUNNEL: Pipeline + Booking + Closed stages combined (all non-Suspect stages).\n' +
-        '    "total funnel"/"full funnel" → ALL stages EXCEPT Suspect.\n' +
-        '  NEVER use IsClosed = false (it incorrectly includes Closed Lost, SDF Rejected etc. because SF IsClosed flag is inconsistent).\n' +
+        '  CRITICAL: Generate TWO queries — one for won (filtered by B_Deal_Date__c), one for all consumed (filtered by CloseDate).\n' +
+        '    Query 1 (Won): SELECT Account_Cluster__c, SUM(Amount) wonVal, COUNT(Id) wonCnt\n' +
+        '      FROM Opportunity WHERE StageName = \'Order\' AND B_Deal_Date__c >= 2025-04-01 AND B_Deal_Date__c <= 2026-03-31\n' +
+        '      GROUP BY Account_Cluster__c ORDER BY SUM(Amount) DESC LIMIT 2000\n' +
+        '    Query 2 (Consumed): SELECT Account_Cluster__c, StageName, SUM(Amount) consVal, COUNT(Id) consCnt\n' +
+        '      FROM Opportunity WHERE StageName IN (\'Order\',\'Negotiation\',\'Closed Lost\',\'Closed-No decision\',\'Closed Unknown\',\'Closed Duplicate\',\'Rejected\',\'SDF Rejected\')\n' +
+        '      AND CloseDate >= 2025-04-01 AND CloseDate <= 2026-03-31\n' +
+        '      GROUP BY Account_Cluster__c, StageName ORDER BY Account_Cluster__c LIMIT 2000\n' +
+        '  The summary step will then: per cluster, win rate by value = wonVal / sum(consVal), win rate by count = wonCnt / sum(consCnt).\n' +
+        '  ALWAYS show BOTH win rate by value AND win rate by count. The gap between them reveals deal-size patterns.\n' +
+        'PIPELINE / FUNNEL STAGE MAPPING (CRM Buddy Mapping Dictionary, Tableau-validated):\n' +
+        '  These are the EXACT stage sets. Use the concept the user mentions:\n' +
+        '  "pipeline" → StageName IN (\'Prospect\',\'Approach\',\'Proposal\',\'Negotiation\',\'SDF Submission\',\'On Hold\',\'Closed won - Pending\',\'Order\',\'Closed Unknown\',\'Closed Duplicate\',\'Closed-No decision\',\'Closed Lost\',\'POC Closed\')\n' +
+        '    Pipeline = full lifecycle. Includes open + won + lost. Excludes Suspect, Rejected, SDF Rejected.\n' +
+        '  "funnel" / "total funnel" → StageName IN (\'Prospect\',\'Approach\',\'Proposal\',\'Negotiation\',\'SDF Submission\',\'On Hold\',\'Closed won - Pending\',\'POC\',\'Order\',\'Closed Unknown\',\'Closed Duplicate\',\'Closed-No decision\',\'Closed Lost\')\n' +
+        '    Same as Pipeline but with POC instead of POC Closed.\n' +
+        '  "open funnel" / "open pipeline" / "active deals" / "active opportunities" → StageName IN (\'Prospect\',\'Approach\',\'Proposal\',\'Negotiation\',\'SDF Submission\',\'On Hold\',\'Closed won - Pending\')\n' +
+        '    Only deals not yet won or lost.\n' +
+        '  "closed funnel" / "closed deals" / "lost deals" → StageName IN (\'Closed Unknown\',\'Closed Duplicate\',\'Closed-No decision\',\'Closed Lost\',\'POC Closed\')\n' +
+        '  "order" / "booking" / "won deals" → StageName IN (\'POC\',\'Order\')\n' +
+        '  NOTE: Suspect is NOT in any concept above. Only include if user explicitly asks for "suspects" or "all stages".\n' +
+        '  NEVER use IsClosed = false (SF IsClosed flag is inconsistent with these mappings).\n' +
         '  VALUE FIELD: Use Normalize_Amount_INR__c (formula, already INR-normalized — matches Tableau dashboard).\n' +
         '    Normalize_Amount_INR__c CAN be used in SUM() with GROUP BY. It just cannot be in the GROUP BY clause itself.\n' +
         '    DO NOT use Amount for pipeline totals (it inflates multi-currency deals). DO NOT use Net_New_INR__c (zero for non-won).\n' +
         '    For MRR-based pipeline, use MRR_Amount__c.\n' +
-        '  DATE FILTER: Pipeline queries should NOT filter by date unless user asks for "pipeline created this quarter".\n' +
-        '    "Total pipeline" / "current pipeline" = all open deals regardless of when created.\n' +
-        '    "This year pipeline" = all currently open deals (NOT filtered by CreatedDate or CloseDate).\n' +
+        '  DATE FILTER FOR PIPELINE: Pipeline/funnel = CURRENT STATE of deals. Do NOT add date filters by default.\n' +
+        '    "Total pipeline" / "current pipeline" / "pipeline this year" = all currently open deals, NO date filter.\n' +
+        '    Pipeline is a SNAPSHOT, not a historical query. A deal in Negotiation IS this year\'s pipeline regardless of when it was created.\n' +
+        '    ONLY add a date filter if user explicitly asks WHEN deals were created: "pipeline created this quarter" → filter by CreatedDate.\n' +
+        '    NEVER use ISQL_Accepted_Date__c as a date filter for general pipeline queries.\n' +
+        '  FORECAST CATEGORY: Forecast_Category__c has values: Pipeline, Upside, Commit\n' +
+        '    "forecast pipeline" / "forecasted deals" / "total forecast pipeline" → Forecast_Category__c = \'Upside\' + open funnel stages, NO date filter.\n' +
+        '      This is the subset of open pipeline that sales leadership considers likely to close. Matches CRM Buddy Booking Forecast.\n' +
+        '    "commit deals" / "committed pipeline" → Forecast_Category__c = \'Commit\' + open funnel stages\n' +
+        '    "upside" / "upside pipeline" → Forecast_Category__c = \'Upside\' + open funnel stages\n' +
+        '    "weighted pipeline" → Forecast_Category__c IN (\'Upside\',\'Commit\') + open funnel stages\n' +
         '  Group by: StageName, Account_Cluster__c, Account_Region__c, Forecast_Category__c, Owner.Name, SKU__c\n' +
         '  Example: SELECT Account_Cluster__c, StageName, COUNT(Id) cnt, SUM(Normalize_Amount_INR__c) pipelineValue\n' +
-        '    FROM Opportunity WHERE StageName IN (\'Approach\',\'Prospect\',\'Proposal\',\'Negotiation\',\'SDF Submission\',\'POC\',\'On Hold\')\n' +
+        '    FROM Opportunity WHERE StageName IN (\'Prospect\',\'Approach\',\'Proposal\',\'Negotiation\',\'SDF Submission\',\'On Hold\',\'Closed won - Pending\')\n' +
         '    GROUP BY Account_Cluster__c, StageName ORDER BY SUM(Normalize_Amount_INR__c) DESC LIMIT 2000\n' +
-        '  OPPORTUNITY ANALYSIS (Tableau "Accepted" view): Uses ISQL_Accepted_Date__c for date filter across ALL stages.\n' +
-        '    If user references "opportunity analysis" or "accepted pipeline", filter by ISQL_Accepted_Date__c, not StageName.\n\n' +
+        '  ACCEPTED PIPELINE / OPPORTUNITY ANALYSIS (Tableau "Accepted" view):\n' +
+        '    Triggered when user says "accepted pipeline", "opportunity analysis", "accepted deals", or "ISQL accepted".\n' +
+        '    Uses the CRM Buddy Calculated_ISQL_Date logic (CASE by ISQL_Stage__c):\n' +
+        '      ISQL Accepted → date = ISQL_Accepted_Date__c\n' +
+        '      ISQL Pending → date = Created_Date__c (formula: COALESCE of Actual_Created_Date, CreatedDate)\n' +
+        '      ISQL Rejected → date = ISQL_Rejected_Date__c\n' +
+        '    For "accepted pipeline this FY": filter by ISQL_Accepted_Date__c in FY, use Pipeline stages (excl Suspect/Rejected/SDF Rejected).\n' +
+        '    NOT for general pipeline queries.\n' +
+        '\n' +
+        'SLANG / ABBREVIATION MAPPINGS (CRM Buddy Mapping Dictionary):\n' +
+        '  Region: "Dom"/"Domestic" → Domestic Enterprise, "Int" → International\n' +
+        '  Cluster: "BI" → Banking and Insurance, "FS" → Financial Services, "Tech" → Technology\n' +
+        '  Parent SKU: "AI" → Gen AI, "ECC" → Contact Centre / Contact Center\n' +
+        '  Deal Category: "Subs"/"Sub" → Subscription, "OT" → One Time\n' +
+        '  Voice Commit: "Commit"/"Commit Deal" → Voice Commit Deals, "Non Commit" → Voice Non-Commit Deals\n' +
+        '  Reversal: "Reversals"/"Reversal" → includes Partial Reversal and Reversal Reversal\n\n' +
         'AVERAGE DEAL SIZE: SUM(Normalize_Amount_INR__c)/COUNT(Id) for pipeline, SUM(Net_New_INR__c)/COUNT(Id) for bookings — compute in summary, not in SOQL.\n' +
         'SALES CYCLE: AVG of (CloseDate - CreatedDate) — SOQL cannot do date arithmetic. Fetch both dates, compute in summary.\n\n' +
         '=== MULTI-QUERY ANALYTICS ===\n' +
@@ -1437,12 +2050,12 @@ public with sharing class AiSalesAssistantController {
         'ADMIN DATA: If you see "Super User" or "System Administrator" roles in sales rankings, these are\n' +
         '  admin-attributed deals (data artifacts), NOT real sales performance. Exclude them from rankings.\n' +
         '  Real sales roles: Sales_*, *AM (Account Manager), Inside Sales. CX/CSM are customer success.\n\n' +
-        'WIN RATE ANALYSIS: When data includes StageName with both Order and lost stages:\n' +
-        '  - Won = StageName=\'Order\' rows. Lost/Consumed = all other terminal stages.\n' +
-        '  - Win Rate by Value = SUM(won Amount) / SUM(total Amount) per dimension.\n' +
-        '  - Win Rate by Count = COUNT(won deals) / COUNT(total deals) per dimension.\n' +
-        '  - Present BOTH value and count win rates — they tell different stories.\n' +
-        '  - Note: Net_New_INR__c is only populated for won deals. For win rate denominator, Amount is correct.\n' +
+        'WIN RATE ANALYSIS (Tableau-validated formula):\n' +
+        '  - Data arrives as two queries: Query 1 = Won (StageName=Order, B_Deal_Date__c), Query 2 = Consumed (terminal + Negotiation, CloseDate).\n' +
+        '  - Win Rate by Value = SUM(won Amount) / SUM(consumed Amount) per dimension.\n' +
+        '  - Win Rate by Count = COUNT(won deals) / COUNT(consumed deals) per dimension.\n' +
+        '  - ALWAYS present BOTH value and count win rates. A large gap means "winning small deals, losing large ones" (or vice versa).\n' +
+        '  - Consumed includes Negotiation stage (deals that reached pricing/terms). This matches Tableau Key KPIs dashboard.\n' +
         '  - Rank dimensions (clusters, owners, etc.) by win rate and highlight best/worst performers.\n\n' +
         'TOTALS ACCURACY: When computing grand totals from query results:\n' +
         '  - ALWAYS sum ALL rows in the result set, not just the ones shown in the table.\n' +
@@ -1468,8 +2081,12 @@ public with sharing class AiSalesAssistantController {
         '    - Convert ALL values to INR before ranking (1 USD=83 INR, 1 AED=23 INR).\n' +
         '    - Show converted ₹ values in the ranking table.\n' +
         '    - Note the conversion rate used.\n\n' +
-        'CURRENCY DISPLAY: Format ALL monetary values in Indian Lakhs: ₹X.XX L (divide by 100,000).\n' +
-        '  Example: 2142000 → ₹21.42 L. 50000000 → ₹500.00 L. For values above ₹100 L, you may use Cr (₹X.XX Cr = divide by 10,000,000).\n' +
+        'CURRENCY DISPLAY: Format ALL monetary values in Indian Lakhs or Crores.\n' +
+        '  1 Lakh = 100,000 (10^5). 1 Crore = 10,000,000 (10^7). Lakhs is NOT millions.\n' +
+        '  To convert raw value to Lakhs: divide by 100,000 (NOT 1,000,000).\n' +
+        '  Examples: 2142000 → ₹21.42 L.  24265419 → ₹242.65 L.  50000000 → ₹500.00 L.  150000000 → ₹15.00 Cr.\n' +
+        '  For values ≥ ₹100 L (i.e. ≥ 1 Cr raw), use Crores. Otherwise use Lakhs.\n' +
+        '  IMPORTANT: PRE-COMPUTED TOTALS already include Lakhs/Crores formatting in parentheses — use those formatted values directly.\n' +
         '  Be consistent within one response — pick Lakhs or Crores based on the magnitude of the largest value.\n\n' +
         'PIPELINE AGING: When analyzing pipeline/open deals, classify deal health by age:\n' +
         '  🔴 Critical: >120 days open (stale, needs intervention)\n' +
@@ -1546,6 +2163,48 @@ public with sharing class AiSalesAssistantController {
             String dateContext = '\n[Today is ' + String.valueOf(today) +
                 '. Current FY started ' + fyStartYear + '-04-01.]';
             String enrichedQuestion = userQuestion + dateContext;
+
+            // Step -1: KPI deterministic engine (no Claude for query generation)
+            // Must run BEFORE conversation history prepend — uses raw question for phrase matching
+            try {
+                KpiResult kpiResult = runKpiEngine(userQuestion, today);
+                if (kpiResult != null) {
+                    System.debug('KPI_ENGINE: ' + kpiResult.kpiId + ' detected, bypassing planner + SOQL prompt');
+
+                    // Build conversation for Claude summary-only
+                    List<Map<String, String>> kpiConversation = new List<Map<String, String>>();
+                    kpiConversation.add(new Map<String, String>{
+                        'role' => 'user',
+                        'content' => userQuestion
+                    });
+                    kpiConversation.add(new Map<String, String>{
+                        'role' => 'assistant',
+                        'content' => 'I used the deterministic KPI engine (' + kpiResult.kpiLabel +
+                            ') and executed ' + kpiResult.soqlQueries.size() + ' query(ies) against ' +
+                            kpiResult.totalRecords + ' records. Results are pre-computed.'
+                    });
+                    kpiConversation.add(new Map<String, String>{
+                        'role' => 'user',
+                        'content' => 'Here are the pre-computed KPI results. Present them as a business summary:\n\n' +
+                            kpiResult.resultsJson
+                    });
+
+                    ClaudeApiService.ClaudeResponse kpiSummary =
+                        ClaudeApiService.sendConversation(KPI_SUMMARY_PROMPT, kpiConversation, 8192);
+
+                    resp.answer = kpiSummary.content;
+                    resp.soqlQuery = String.join(kpiResult.soqlQueries, '\n---\n');
+                    resp.recordCount = kpiResult.totalRecords;
+                    resp.success = true;
+                    resp.executionTimeMs = System.currentTimeMillis() - startTime;
+                    logQuery(userQuestion, kpiResult.soqlQueries[0], kpiResult.soqlQueries[0],
+                             kpiResult.totalRecords, true, null, 'KPI_ENGINE', 0, resp.executionTimeMs);
+                    return resp;
+                }
+            } catch (Exception kpiEx) {
+                // KPI engine error — log and fall through to existing flow
+                System.debug(LoggingLevel.WARN, 'KPI_ENGINE_ERROR: ' + kpiEx.getMessage() + ' — falling through');
+            }
 
             // Prepend full conversation history so Claude can resolve follow-ups
             if (String.isNotBlank(conversationContext)) {
@@ -1741,6 +2400,9 @@ public with sharing class AiSalesAssistantController {
                     List<SObject> records = (List<SObject>) result.get('records');
                     sectionJson = JSON.serialize(records);
                 }
+
+                // Pre-format monetary values in Lakhs/Crores so Claude doesn't do the math
+                sectionJson = enrichJsonWithLakhsFormatting(sectionJson);
 
                 // Compute aggregate totals BEFORE trimming (uses full dataset)
                 String computedTotals = computeAggregateTotals(result);
@@ -1966,12 +2628,21 @@ public with sharing class AiSalesAssistantController {
         'total__c', 'count__c', 'bvt__c', 'revenue__c'
     };
 
+    // Known non-measure numeric fields that should never be summed
+    // (even though they contain measure-like substrings like 'rev' in 'revMonth')
+    private static final Set<String> NON_MEASURE_FIELDS = new Set<String>{
+        'revmonth', 'revyear', 'quarter', 'month', 'year', 'recordcount',
+        'escalation_level__c', 'ticket_reopen_count__c'
+    };
+
     @TestVisible
     private static Boolean isMeasureField(String fieldKey) {
         if (fieldKey == null) return false;
-        // exprN fields from AggregateResult are always measures (SUM, COUNT, AVG, etc.)
-        if (fieldKey.toLowerCase().startsWith('expr')) return true;
         String lower = fieldKey.toLowerCase();
+        // Exclusion list: known non-measure numeric fields
+        if (NON_MEASURE_FIELDS.contains(lower)) return false;
+        // exprN fields from AggregateResult are always measures (SUM, COUNT, AVG, etc.)
+        if (lower.startsWith('expr')) return true;
         // Exact match on known aliases (e.g., 'rev', 'gp', 'cnt')
         if (MEASURE_ALIASES.contains(lower)) return true;
         // Suffix match on Salesforce field API names (e.g., Revenue_Booked_Amount__c)
@@ -1983,6 +2654,77 @@ public with sharing class AiSalesAssistantController {
             if (lower.contains(alias)) return true;
         }
         return false;
+    }
+
+    /**
+     * Formats a raw numeric value as Indian Lakhs (÷100,000) or Crores (÷10,000,000).
+     * This ensures Claude never has to do the Lakhs/Crores division itself,
+     * eliminating the common LLM error of dividing by 1,000,000 instead of 100,000.
+     */
+    @TestVisible
+    private static String formatAsLakhs(Decimal value) {
+        if (value == null) return '₹0.00 L';
+        Decimal absVal = value < 0 ? -value : value;
+        String sign = value < 0 ? '-' : '';
+        if (absVal >= 1000000000) {
+            // >= ₹10,000 L (₹100 Cr) → show in Crores for very large values only
+            Decimal crores = absVal / 10000000;
+            return sign + '₹' + crores.setScale(2) + ' Cr';
+        } else {
+            // Show in Lakhs — consistent with Tableau dashboards
+            Decimal lakhs = absVal / 100000;
+            return sign + '₹' + lakhs.setScale(2) + ' L';
+        }
+    }
+
+    /**
+     * Enriches JSON result rows with pre-formatted Lakhs/Crores values for measure fields.
+     * Adds a "_display" suffixed key for each numeric measure, e.g.:
+     * "monthlyGP":24265419.21 → also adds "monthlyGP_display":"₹242.65 L"
+     * This eliminates Claude's need to do Lakhs division (which it often gets wrong).
+     */
+    @TestVisible
+    private static String enrichJsonWithLakhsFormatting(String jsonStr) {
+        try {
+            List<Object> rows = (List<Object>) JSON.deserializeUntyped(jsonStr);
+            if (rows == null || rows.isEmpty()) return jsonStr;
+
+            // Identify measure fields from first row
+            Map<String, Object> firstRow = (Map<String, Object>) rows[0];
+            Set<String> measureKeys = new Set<String>();
+            for (String key : firstRow.keySet()) {
+                if (key == 'attributes' || key == 'Id') continue;
+                Object val = firstRow.get(key);
+                if ((val instanceof Decimal || val instanceof Double || val instanceof Integer || val instanceof Long)
+                    && isMeasureField(key)) {
+                    measureKeys.add(key);
+                }
+            }
+
+            if (measureKeys.isEmpty()) return jsonStr;
+
+            // Enrich each row with _display values
+            for (Object rowObj : rows) {
+                Map<String, Object> row = (Map<String, Object>) rowObj;
+                for (String key : measureKeys) {
+                    Object val = row.get(key);
+                    if (val != null) {
+                        Decimal numVal;
+                        if (val instanceof Decimal) numVal = (Decimal) val;
+                        else if (val instanceof Double) numVal = (Decimal) (Double) val;
+                        else if (val instanceof Integer) numVal = (Decimal) (Integer) val;
+                        else if (val instanceof Long) numVal = (Decimal) (Long) val;
+                        else continue;
+                        row.put(key + '_display', formatAsLakhs(numVal));
+                    }
+                }
+            }
+
+            return JSON.serialize(rows);
+        } catch (Exception e) {
+            // Non-critical — return original JSON if enrichment fails
+            return jsonStr;
+        }
     }
 
     private static String computeAggregateTotals(Map<String, Object> queryResult) {
@@ -2034,11 +2776,14 @@ public with sharing class AiSalesAssistantController {
                 }
             }
 
-            // Format totals line
+            // Format totals line — show BOTH raw value and Lakhs-formatted value
+            // so Claude never has to do the Lakhs division itself
             String result = 'PRE-COMPUTED TOTALS (use these exact values, do NOT recompute): ';
             List<String> parts = new List<String>();
             for (String key : totals.keySet()) {
-                parts.add(key + '=' + totals.get(key).setScale(2));
+                Decimal val = totals.get(key).setScale(2);
+                String formatted = formatAsLakhs(val);
+                parts.add(key + '=' + val + ' (' + formatted + ')');
             }
             return result + String.join(parts, ', ') + '\n';
         } catch (Exception e) {

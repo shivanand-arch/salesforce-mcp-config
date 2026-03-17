@@ -1402,4 +1402,607 @@ private class AiSalesAssistantControllerTest {
 
         AiSalesAssistantController.testRegistryOverride = null;
     }
+
+    // ==================== formatAsLakhs Tests ====================
+
+    @isTest
+    static void testFormatAsLakhs_SmallValue() {
+        // 2,142,000 → ₹21.42 L
+        String result = AiSalesAssistantController.formatAsLakhs(2142000);
+        System.assertEquals('₹21.42 L', result, 'Should format 2142000 as ₹21.42 L');
+    }
+
+    @isTest
+    static void testFormatAsLakhs_MobilityGPApril() {
+        // The exact value that caused the 10x bug: 24,265,419.21 should be ₹242.65 L
+        String result = AiSalesAssistantController.formatAsLakhs(24265419.21);
+        System.assertEquals('₹242.65 L', result, 'Should format 24265419.21 as ₹242.65 L (NOT ₹24.27 L)');
+    }
+
+    @isTest
+    static void testFormatAsLakhs_LargeLakhsValue() {
+        // 150,000,000 → ₹1500.00 L (under Crore threshold of 1B)
+        String result = AiSalesAssistantController.formatAsLakhs(150000000);
+        System.assertEquals('₹1500.00 L', result, 'Should format 150M as ₹1500.00 L');
+    }
+
+    @isTest
+    static void testFormatAsLakhs_CroreValue() {
+        // 1,500,000,000 (1.5B) → ₹150.00 Cr (above Crore threshold)
+        String result = AiSalesAssistantController.formatAsLakhs(1500000000);
+        System.assertEquals('₹150.00 Cr', result, 'Should format 1.5B as ₹150.00 Cr');
+    }
+
+    @isTest
+    static void testFormatAsLakhs_NegativeValue() {
+        String result = AiSalesAssistantController.formatAsLakhs(-5000000);
+        System.assertEquals('-₹50.00 L', result, 'Should handle negative values');
+    }
+
+    @isTest
+    static void testFormatAsLakhs_ZeroValue() {
+        String result = AiSalesAssistantController.formatAsLakhs(0);
+        System.assertEquals('₹0.00 L', result, 'Should handle zero');
+    }
+
+    @isTest
+    static void testFormatAsLakhs_NullValue() {
+        String result = AiSalesAssistantController.formatAsLakhs(null);
+        System.assertEquals('₹0.00 L', result, 'Should handle null');
+    }
+
+    // ==================== enrichJsonWithLakhsFormatting Tests ====================
+
+    @isTest
+    static void testEnrichJson_AddsDisplayFields() {
+        // Simulate aggregate query result with GP values
+        List<Map<String, Object>> rows = new List<Map<String, Object>>();
+        Map<String, Object> row1 = new Map<String, Object>{
+            'revMonth' => 4, 'revYear' => 2025, 'Currency__c' => 'INR',
+            'monthlyGP' => 24265419.21
+        };
+        Map<String, Object> row2 = new Map<String, Object>{
+            'revMonth' => 5, 'revYear' => 2025, 'Currency__c' => 'INR',
+            'monthlyGP' => 24242818.38
+        };
+        rows.add(row1);
+        rows.add(row2);
+
+        String inputJson = JSON.serialize(rows);
+        String enrichedJson = AiSalesAssistantController.enrichJsonWithLakhsFormatting(inputJson);
+
+        // Parse and verify _display fields were added
+        List<Object> parsed = (List<Object>) JSON.deserializeUntyped(enrichedJson);
+        Map<String, Object> parsedRow1 = (Map<String, Object>) parsed[0];
+        System.assert(parsedRow1.containsKey('monthlyGP_display'), 'Should add monthlyGP_display');
+        System.assertEquals('₹242.65 L', (String) parsedRow1.get('monthlyGP_display'),
+            'Display value should be ₹242.65 L');
+
+        Map<String, Object> parsedRow2 = (Map<String, Object>) parsed[1];
+        System.assertEquals('₹242.43 L', (String) parsedRow2.get('monthlyGP_display'),
+            'Display value should be ₹242.43 L');
+    }
+
+    @isTest
+    static void testEnrichJson_SkipsNonMeasureFields() {
+        List<Map<String, Object>> rows = new List<Map<String, Object>>();
+        Map<String, Object> row = new Map<String, Object>{
+            'revMonth' => 4, 'totalRev' => 50000000
+        };
+        rows.add(row);
+
+        String enrichedJson = AiSalesAssistantController.enrichJsonWithLakhsFormatting(JSON.serialize(rows));
+        List<Object> parsed = (List<Object>) JSON.deserializeUntyped(enrichedJson);
+        Map<String, Object> parsedRow = (Map<String, Object>) parsed[0];
+
+        // revMonth is NOT a measure field — should not get _display
+        System.assert(!parsedRow.containsKey('revMonth_display'), 'Should not add display for non-measure fields');
+        // totalRev IS a measure — should get _display
+        System.assert(parsedRow.containsKey('totalRev_display'), 'Should add display for measure fields');
+        System.assertEquals('₹500.00 L', (String) parsedRow.get('totalRev_display'));
+    }
+
+    @isTest
+    static void testEnrichJson_HandlesEmptyJson() {
+        String result = AiSalesAssistantController.enrichJsonWithLakhsFormatting('[]');
+        System.assertEquals('[]', result, 'Should return empty array unchanged');
+    }
+
+    // ── KPI Engine Tests ──────────────────────────────────────────────────
+
+    static List<Map<String, Object>> buildTestKpiRegistry() {
+        List<Map<String, Object>> registry = new List<Map<String, Object>>();
+
+        // WIN_RATE
+        Map<String, Object> winRate = new Map<String, Object>();
+        winRate.put('id', 'WIN_RATE');
+        winRate.put('displayName', 'Win Rate');
+        winRate.put('formulaType', 'RATIO');
+        winRate.put('questionTerms', new List<Object>{ 'win rate', 'win %', 'win percentage' });
+        winRate.put('defaultDimension', 'Account_Cluster__c');
+        Map<String, Object> dims = new Map<String, Object>();
+        dims.put('cluster', 'Account_Cluster__c');
+        dims.put('region', 'Account_Region__c');
+        dims.put('owner', 'Owner.Name');
+        winRate.put('supportedDimensions', dims);
+        winRate.put('showBothValueAndCount', true);
+        winRate.put('interpretationNote', 'Test note');
+
+        Map<String, Object> numSpec = new Map<String, Object>();
+        numSpec.put('measureField', 'Amount');
+        numSpec.put('measureFn', 'SUM');
+        numSpec.put('countField', 'Id');
+        numSpec.put('dateField', 'B_Deal_Date__c');
+        numSpec.put('stageFilter', new List<Object>{ 'Order' });
+        winRate.put('numerator', numSpec);
+
+        Map<String, Object> denSpec = new Map<String, Object>();
+        denSpec.put('measureField', 'Amount');
+        denSpec.put('measureFn', 'SUM');
+        denSpec.put('countField', 'Id');
+        denSpec.put('dateField', 'CloseDate');
+        denSpec.put('stageFilter', new List<Object>{
+            'Order', 'Negotiation', 'Closed Lost', 'Closed-No decision',
+            'Closed Unknown', 'Closed Duplicate', 'Rejected', 'SDF Rejected'
+        });
+        winRate.put('denominator', denSpec);
+        registry.add(winRate);
+
+        // CONVERSION_RATE
+        Map<String, Object> convRate = new Map<String, Object>();
+        convRate.put('id', 'CONVERSION_RATE');
+        convRate.put('displayName', 'Conversion Rate');
+        convRate.put('formulaType', 'RATIO');
+        convRate.put('questionTerms', new List<Object>{ 'conversion rate', 'conversion ratio' });
+        convRate.put('defaultDimension', 'Account_Cluster__c');
+        convRate.put('supportedDimensions', dims);
+        convRate.put('showBothValueAndCount', true);
+        convRate.put('numerator', numSpec);
+        convRate.put('denominator', denSpec);
+        registry.add(convRate);
+
+        // SALES_CYCLE_AVG
+        Map<String, Object> cycleAvg = new Map<String, Object>();
+        cycleAvg.put('id', 'SALES_CYCLE_AVG');
+        cycleAvg.put('displayName', 'Average Sales Cycle');
+        cycleAvg.put('formulaType', 'AVERAGE');
+        cycleAvg.put('questionTerms', new List<Object>{ 'average sales cycle', 'avg sales cycle', 'sales cycle' });
+        cycleAvg.put('defaultDimension', 'Account_Cluster__c');
+        cycleAvg.put('supportedDimensions', dims);
+        Map<String, Object> comp = new Map<String, Object>();
+        comp.put('startDateField', 'ISQL_Accepted_Date__c');
+        comp.put('endDateField', 'B_Deal_Date__c');
+        comp.put('stageFilter', new List<Object>{ 'Order' });
+        comp.put('maxDetailRows', 10000);
+        cycleAvg.put('computation', comp);
+        registry.add(cycleAvg);
+
+        // SALES_CYCLE_MEDIAN
+        Map<String, Object> cycleMed = new Map<String, Object>();
+        cycleMed.put('id', 'SALES_CYCLE_MEDIAN');
+        cycleMed.put('displayName', 'Median Sales Cycle');
+        cycleMed.put('formulaType', 'MEDIAN');
+        cycleMed.put('questionTerms', new List<Object>{ 'median sales cycle', 'sales cycle median' });
+        cycleMed.put('defaultDimension', 'Account_Cluster__c');
+        cycleMed.put('supportedDimensions', dims);
+        cycleMed.put('computation', comp);
+        registry.add(cycleMed);
+
+        return registry;
+    }
+
+    // ── KPI Detection Tests ──
+
+    @isTest
+    static void testDetectKpi_WinRate() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        Map<String, Object> kpi = AiSalesAssistantController.detectKpiIntent(
+            'What is our win rate across all clusters this FY?');
+        System.assertNotEquals(null, kpi, 'Should detect WIN_RATE');
+        System.assertEquals('WIN_RATE', kpi.get('id'));
+    }
+
+    @isTest
+    static void testDetectKpi_WinPercent() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        Map<String, Object> kpi = AiSalesAssistantController.detectKpiIntent(
+            'What is the win % for APAC this quarter?');
+        System.assertNotEquals(null, kpi, 'Should detect WIN_RATE from "win %"');
+        System.assertEquals('WIN_RATE', kpi.get('id'));
+    }
+
+    @isTest
+    static void testDetectKpi_ConversionRate() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        Map<String, Object> kpi = AiSalesAssistantController.detectKpiIntent(
+            'What is the conversion rate this month?');
+        System.assertNotEquals(null, kpi, 'Should detect CONVERSION_RATE');
+        System.assertEquals('CONVERSION_RATE', kpi.get('id'));
+    }
+
+    @isTest
+    static void testDetectKpi_AvgSalesCycle() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        Map<String, Object> kpi = AiSalesAssistantController.detectKpiIntent(
+            'What is the average sales cycle this FY?');
+        System.assertNotEquals(null, kpi, 'Should detect SALES_CYCLE_AVG');
+        System.assertEquals('SALES_CYCLE_AVG', kpi.get('id'));
+    }
+
+    @isTest
+    static void testDetectKpi_MedianSalesCycle() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        Map<String, Object> kpi = AiSalesAssistantController.detectKpiIntent(
+            'What is the median sales cycle for Domestic Enterprise?');
+        System.assertNotEquals(null, kpi, 'Should detect SALES_CYCLE_MEDIAN');
+        System.assertEquals('SALES_CYCLE_MEDIAN', kpi.get('id'));
+    }
+
+    @isTest
+    static void testDetectKpi_NoMatch() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        Map<String, Object> kpi = AiSalesAssistantController.detectKpiIntent(
+            'Show me the top 10 customers by revenue this quarter');
+        System.assertEquals(null, kpi, 'Should not match any KPI');
+    }
+
+    @isTest
+    static void testDetectKpi_NullInput() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        Map<String, Object> kpi = AiSalesAssistantController.detectKpiIntent(null);
+        System.assertEquals(null, kpi, 'Null input should return null');
+    }
+
+    // ── KPI Grouping Detection Tests ──
+
+    @isTest
+    static void testExtractGrouping_Cluster() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        Map<String, Object> kpi = AiSalesAssistantController.detectKpiIntent('What is our win rate?');
+        String dim = AiSalesAssistantController.extractKpiGrouping(
+            'What is the win rate across all clusters this FY?', kpi);
+        System.assertEquals('Account_Cluster__c', dim, 'Should detect cluster dimension');
+    }
+
+    @isTest
+    static void testExtractGrouping_Region() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        Map<String, Object> kpi = AiSalesAssistantController.detectKpiIntent('What is our win rate?');
+        String dim = AiSalesAssistantController.extractKpiGrouping(
+            'What is the win rate by region this FY?', kpi);
+        System.assertEquals('Account_Region__c', dim, 'Should detect region dimension');
+    }
+
+    @isTest
+    static void testExtractGrouping_Default() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        Map<String, Object> kpi = AiSalesAssistantController.detectKpiIntent('What is our win rate?');
+        String dim = AiSalesAssistantController.extractKpiGrouping(
+            'What is the win rate this FY?', kpi);
+        System.assertEquals('Account_Cluster__c', dim, 'Should use default dimension');
+    }
+
+    // ── KPI Time Range Tests ──
+
+    @isTest
+    static void testExtractTimeRange_CurrentFY() {
+        Date today = Date.newInstance(2026, 3, 14);
+        Map<String, Object> range = AiSalesAssistantController.extractKpiTimeRange(
+            'What is the win rate this FY?', today);
+        System.assertEquals(Date.newInstance(2025, 4, 1), range.get('start'));
+        // FY end uses full fiscal year boundary (Mar 31), not today — matches Tableau
+        System.assertEquals(Date.newInstance(2026, 3, 31), range.get('end'));
+        System.assert(((String) range.get('label')).contains('FY2025'));
+    }
+
+    @isTest
+    static void testExtractTimeRange_ThisQuarter() {
+        Date today = Date.newInstance(2026, 3, 14);
+        Map<String, Object> range = AiSalesAssistantController.extractKpiTimeRange(
+            'What is the win rate this quarter?', today);
+        System.assertEquals(Date.newInstance(2026, 1, 1), range.get('start'));
+        // Quarter end uses full quarter boundary — matches Tableau
+        System.assertEquals(Date.newInstance(2026, 3, 31), range.get('end'));
+    }
+
+    @isTest
+    static void testExtractTimeRange_ThisMonth() {
+        Date today = Date.newInstance(2026, 3, 14);
+        Map<String, Object> range = AiSalesAssistantController.extractKpiTimeRange(
+            'What is the conversion rate this month?', today);
+        System.assertEquals(Date.newInstance(2026, 3, 1), range.get('start'));
+        System.assertEquals(today, range.get('end'));
+    }
+
+    @isTest
+    static void testExtractTimeRange_LastQuarter() {
+        Date today = Date.newInstance(2026, 3, 14);
+        Map<String, Object> range = AiSalesAssistantController.extractKpiTimeRange(
+            'What was the win rate last quarter?', today);
+        System.assertEquals(Date.newInstance(2025, 10, 1), range.get('start'));
+        System.assertEquals(Date.newInstance(2025, 12, 31), range.get('end'));
+    }
+
+    @isTest
+    static void testExtractTimeRange_LastMonth() {
+        Date today = Date.newInstance(2026, 3, 14);
+        Map<String, Object> range = AiSalesAssistantController.extractKpiTimeRange(
+            'Show me last month conversion rate', today);
+        System.assertEquals(Date.newInstance(2026, 2, 1), range.get('start'));
+        System.assertEquals(Date.newInstance(2026, 2, 28), range.get('end'));
+    }
+
+    // ── Formula Computation Tests ──
+
+    @isTest
+    static void testComputeMedian_OddCount() {
+        List<Integer> vals = new List<Integer>{ 3, 8, 9, 11, 15 };
+        Decimal med = AiSalesAssistantController.computeMedian(vals);
+        System.assertEquals(9, med, 'Median of [3,8,9,11,15] = 9');
+    }
+
+    @isTest
+    static void testComputeMedian_EvenCount() {
+        List<Integer> vals = new List<Integer>{ 3, 8, 11, 15 };
+        Decimal med = AiSalesAssistantController.computeMedian(vals);
+        System.assertEquals(9.5, med, 'Median of [3,8,11,15] = 9.5');
+    }
+
+    @isTest
+    static void testComputeMedian_Empty() {
+        Decimal med = AiSalesAssistantController.computeMedian(new List<Integer>());
+        System.assertEquals(0, med, 'Median of empty = 0');
+    }
+
+    @isTest
+    static void testComputeMedian_SingleValue() {
+        List<Integer> vals = new List<Integer>{ 42 };
+        Decimal med = AiSalesAssistantController.computeMedian(vals);
+        System.assertEquals(42, med, 'Median of [42] = 42');
+    }
+
+    @isTest
+    static void testComputeRatio_Normal() {
+        Decimal ratio = AiSalesAssistantController.computeRatio(25, 100);
+        System.assertEquals(25.00, ratio, 'Ratio 25/100 = 25%');
+    }
+
+    @isTest
+    static void testComputeRatio_DivideByZero() {
+        Decimal ratio = AiSalesAssistantController.computeRatio(25, 0);
+        System.assertEquals(0, ratio, 'Divide by zero returns 0');
+    }
+
+    @isTest
+    static void testComputeRatio_NullDenominator() {
+        Decimal ratio = AiSalesAssistantController.computeRatio(25, null);
+        System.assertEquals(0, ratio, 'Null denominator returns 0');
+    }
+
+    // ── KPI Engine End-to-End (with real Opp data) ──
+
+    @isTest
+    static void testRunKpiEngine_WinRateDetectsAndExecutes() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        // No test Opportunity data — will return 0 rows but should not error
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the win rate across clusters this FY?',
+                Date.newInstance(2026, 3, 14));
+        System.assertNotEquals(null, result, 'Should detect and execute WIN_RATE');
+        System.assertEquals('WIN_RATE', result.kpiId);
+        System.assertEquals(2, result.soqlQueries.size(), 'Win rate needs 2 queries');
+        // Numerator query should use B_Deal_Date__c
+        System.assert(result.soqlQueries[0].contains('B_Deal_Date__c'),
+            'Numerator should filter by B_Deal_Date__c');
+        // Denominator query should use CloseDate
+        System.assert(result.soqlQueries[1].contains('CloseDate'),
+            'Denominator should filter by CloseDate');
+        // Denominator should include Negotiation
+        System.assert(result.soqlQueries[1].contains('Negotiation'),
+            'Denominator should include Negotiation stage');
+    }
+
+    @isTest
+    static void testRunKpiEngine_ConversionRateDetectsAndExecutes() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the conversion rate this quarter?',
+                Date.newInstance(2026, 3, 14));
+        System.assertNotEquals(null, result, 'Should detect CONVERSION_RATE');
+        System.assertEquals('CONVERSION_RATE', result.kpiId);
+    }
+
+    @isTest
+    static void testRunKpiEngine_SalesCycleAvg() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the average sales cycle this FY?',
+                Date.newInstance(2026, 3, 14));
+        System.assertNotEquals(null, result, 'Should detect SALES_CYCLE_AVG');
+        System.assertEquals('SALES_CYCLE_AVG', result.kpiId);
+        System.assertEquals(1, result.soqlQueries.size(), 'Sales cycle needs 1 detail query');
+        System.assert(result.soqlQueries[0].contains('ISQL_Accepted_Date__c'),
+            'Should query ISQL_Accepted_Date__c');
+    }
+
+    @isTest
+    static void testRunKpiEngine_MedianSalesCycle() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the median sales cycle for Domestic Enterprise this quarter?',
+                Date.newInstance(2026, 3, 14));
+        System.assertNotEquals(null, result, 'Should detect SALES_CYCLE_MEDIAN');
+        System.assertEquals('SALES_CYCLE_MEDIAN', result.kpiId);
+    }
+
+    @isTest
+    static void testRunKpiEngine_NoMatch_ReturnsNull() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'Show me revenue by cluster this FY',
+                Date.newInstance(2026, 3, 14));
+        System.assertEquals(null, result, 'Non-KPI question should return null');
+    }
+
+    @isTest
+    static void testRunKpiEngine_WinRateWithRegionGrouping() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the win rate by region this FY?',
+                Date.newInstance(2026, 3, 14));
+        System.assertNotEquals(null, result);
+        System.assertEquals('Account_Region__c', result.dimension);
+    }
+
+    @isTest
+    static void testRunKpiEngine_WinRateThisMonth() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the win rate this month?',
+                Date.newInstance(2026, 3, 14));
+        System.assertNotEquals(null, result);
+        // Verify the date range in the query
+        System.assert(result.soqlQueries[0].contains('2026-03-01'),
+            'This month should start from Mar 1');
+    }
+
+    // ── KPI Parity Tests (Tableau-validated configuration) ──
+
+    @isTest
+    static void testWinRate_NumeratorUsesB_Deal_Date() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the win rate this FY?', Date.newInstance(2026, 3, 14));
+        String numSoql = result.soqlQueries[0];
+        System.assert(numSoql.contains('B_Deal_Date__c'),
+            'PARITY: Won side MUST use B_Deal_Date__c, not CloseDate');
+        System.assert(!numSoql.contains('CloseDate'),
+            'PARITY: Won side MUST NOT use CloseDate');
+    }
+
+    @isTest
+    static void testWinRate_DenominatorUsesCloseDate() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the win rate this FY?', Date.newInstance(2026, 3, 14));
+        String denSoql = result.soqlQueries[1];
+        System.assert(denSoql.contains('CloseDate'),
+            'PARITY: Consumed side MUST use CloseDate');
+        System.assert(!denSoql.contains('B_Deal_Date__c'),
+            'PARITY: Consumed side MUST NOT use B_Deal_Date__c');
+    }
+
+    @isTest
+    static void testWinRate_DenominatorIncludesNegotiation() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the win rate this FY?', Date.newInstance(2026, 3, 14));
+        String denSoql = result.soqlQueries[1];
+        System.assert(denSoql.contains('Negotiation'),
+            'PARITY: Consumed stages MUST include Negotiation');
+    }
+
+    @isTest
+    static void testWinRate_DenominatorIncludesAllTerminalStages() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the win rate this FY?', Date.newInstance(2026, 3, 14));
+        String denSoql = result.soqlQueries[1];
+        // Must include all terminal stages from Tableau Key KPIs dashboard
+        for (String stage : new String[]{ 'Order', 'Negotiation', 'Closed Lost',
+            'Closed-No decision', 'Closed Unknown', 'Closed Duplicate', 'Rejected', 'SDF Rejected' }) {
+            System.assert(denSoql.contains(stage),
+                'PARITY: Consumed MUST include stage: ' + stage);
+        }
+    }
+
+    @isTest
+    static void testWinRate_NoAmountPositiveFilter() {
+        // Parity: queries must NOT filter Amount > 0 (reversals/zeros must be in denominator)
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the win rate this FY?', Date.newInstance(2026, 3, 14));
+        for (String soql : result.soqlQueries) {
+            System.assert(!soql.contains('Amount > 0'),
+                'PARITY: Must NOT filter Amount > 0 — negatives/zeros belong in consumed denominator');
+            System.assert(!soql.contains('Amount != null'),
+                'PARITY: Must NOT filter Amount != null — SUM handles nulls');
+        }
+    }
+
+    @isTest
+    static void testWinRate_UsesAmountNotNetNew() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the win rate this FY?', Date.newInstance(2026, 3, 14));
+        for (String soql : result.soqlQueries) {
+            System.assert(soql.contains('SUM(Amount)'),
+                'PARITY: Must use SUM(Amount), not Net_New_INR__c (which is 0 for lost deals)');
+            System.assert(!soql.contains('Net_New_INR__c'),
+                'PARITY: Must NOT use Net_New_INR__c');
+        }
+    }
+
+    @isTest
+    static void testWinRate_AlwaysUsesKpiEngine() {
+        // When "win rate" is in the question, KPI engine must intercept — not planner
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        Map<String, Object> kpi = AiSalesAssistantController.detectKpiIntent(
+            'What is our win rate across all clusters this FY?');
+        System.assertNotEquals(null, kpi,
+            'PARITY: "win rate" must ALWAYS be caught by KPI engine');
+        System.assertEquals('WIN_RATE', kpi.get('id'));
+    }
+
+    @isTest
+    static void testWinRate_WinPercentAlsoDetected() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        Map<String, Object> kpi = AiSalesAssistantController.detectKpiIntent(
+            'Show me the win % by cluster');
+        System.assertNotEquals(null, kpi,
+            'PARITY: "win %" must also be caught by KPI engine');
+    }
+
+    @isTest
+    static void testWinRate_FYUsesFullYearBoundary() {
+        // PARITY: "this FY" must use full FY end (Mar 31), NOT today.
+        // Tableau includes deals with future CloseDate within FY in consumed denominator.
+        // Root cause of 7.82 Cr gap: 143 deals with CloseDate Mar 15-31 were excluded.
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the win rate this FY?', Date.newInstance(2026, 3, 14));
+        String denSoql = result.soqlQueries[1];
+        System.assert(denSoql.contains('2026-03-31'),
+            'PARITY: Consumed denominator MUST use full FY end (2026-03-31), not today (2026-03-14). ' +
+            'Gap of 7.82 Cr / 143 deals was caused by truncating at today.');
+        System.assert(!denSoql.contains('2026-03-14'),
+            'PARITY: MUST NOT use today as FY end — Tableau uses complete FY boundaries');
+    }
+
+    @isTest
+    static void testWinRate_ResultContainsBothValueAndCount() {
+        AiSalesAssistantController.testKpiRegistryOverride = buildTestKpiRegistry();
+        AiSalesAssistantController.KpiResult result =
+            AiSalesAssistantController.runKpiEngine(
+                'What is the win rate this FY?', Date.newInstance(2026, 3, 14));
+        // Results JSON must contain both rate types
+        System.assert(result.resultsJson.contains('rateByValue'),
+            'PARITY: Must include rateByValue');
+        System.assert(result.resultsJson.contains('rateByCount'),
+            'PARITY: Must include rateByCount');
+    }
 }

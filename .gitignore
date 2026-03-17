@@ -42,3 +42,9 @@ $RECYCLE.BIN/
 **/__pycache__/
 **/.venv/
 **/venv/
+
+# Temp Excel lock files
+~$*.xlsx
+
+# IDE / tooling
+.husky/

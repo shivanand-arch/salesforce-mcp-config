@@ -13,3 +13,37 @@ REV-09|grouped|PASS|accounts_revenue__c|true|6|24064|0|SELECT Parent_SKU__c, Cur
 REV-10|grouped|PASS|accounts_revenue__c|true|2|23058|2|SELECT Account_Manager__c, SUM(Revenue_Booked_Amount__c) totalRevenue, Currency__c
 REV-11|grouped|ERROR|exit_1|||
 REV-12|grouped|PASS|accounts_revenue__c|true|5|25016|0|SELECT Revenue_Classification__c, Currency__c, SUM(GP__c) totalGP, SUM(Revenue_Booked_Amount__c) totalRev
+REV-13|grouped|PASS|accounts_revenue__c|true|284|36856|2|SELECT Currency__c, Cluster__c, Parent_SKU__c, SUM(Revenue_Booked_Amount__c) totalRev, COUNT(Id) recordCount
+REV-14|filtered|PASS|accounts_revenue__c|true|164|36580|2|SELECT Cluster__c, SKU__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev
+REV-15|filtered|PASS|accounts_revenue__c|true|48|46284|2|SELECT Cluster__c, Currency__c, SUM(GP__c) totalGP, SUM(Revenue_Booked_Amount__c) totalRev
+REV-16|filtered|PASS|accounts_revenue__c|true|14|26643|0|SELECT SKU__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev, SUM(GP__c) gp
+REV-17|filtered|PASS|accounts_revenue__c|true|1383|54278|2|SELECT Account__r.Name acctName, SKU__c, Cluster__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev
+REV-18|filtered|PASS|accounts_revenue__c|true|0|19597|2|SELECT Cluster__c, SKU__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev, SUM(GP__c) gp
+REV-19|filtered|PASS|accounts_revenue__c|true|2|22593|2|SELECT Account_Manager__c, Account_Manager__r.Name, Currency__c, SUM(GP__c) totalGP
+REV-20|filtered|PASS|accounts_revenue__c|true|0|20120|2|SELECT Account__r.Name acctName, SKU__c, Parent_SKU__c, Cluster__c, Currency__c,
+REV-21|date_edge|ERROR|exit_1|||
+REV-22|date_edge|PASS|accounts_revenue__c|true|272|46706|2|SELECT Cluster__c, Parent_SKU__c, Currency__c, SUM(Revenue_Booked_Amount__c) q1_rev
+REV-23|date_edge|PASS|accounts_revenue__c|true|526|65137|4|SELECT Cluster__c, Parent_SKU__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev
+REV-24|date_edge|PASS|accounts_revenue__c|true|231|53544|2|SELECT Cluster__c, Currency__c, CALENDAR_MONTH(Revenue_Booked_On__c) revMonth, CALENDAR_YEAR(Revenue_Booked_On__c) revYear, SUM(Revenue_Booked_Amount__c) monthlyRev, SUM(GP__c) monthlyGP
+REV-25|date_edge|PASS|accounts_revenue__c|true|138|35016|0|SELECT Cluster__c, Parent_SKU__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev
+REV-26|large_object|PASS|accounts_revenue__c|true|43|41702|2|SELECT Cluster__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev
+REV-27|large_object|PASS|accounts_revenue__c|true|526|47482|4|SELECT Cluster__c, Parent_SKU__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev
+REV-28|large_object|PASS|accounts_revenue__c|true|132|36356|0|SELECT Cluster__c, Parent_SKU__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev, SUM(GP__c) gp
+REV-29|large_object|PASS|accounts_revenue__c|true|14|27316|0|SELECT SKU__c, Currency__c, SUM(Revenue_Booked_Amount__c) rev
+REV-30|ambiguous|PASS|accounts_revenue__c|true|27|32372|2|SELECT Cluster__c, SKU__c, Currency__c, SUM(Revenue_Booked_Amount__c) revenue, SUM(GP__c) gp
+REV-31|ambiguous|PASS|accounts_revenue__c|true|48|41202|2|SELECT Cluster__c, Currency__c, SUM(Revenue_Booked_Amount__c) totalRevenue, SUM(GP__c) totalGP
+REV-32|ambiguous|FAIL||false|null|16367|0|NULL
+REV-33|ambiguous|PASS|accounts_revenue__c|true|284|52553|2|SELECT Cluster__c, Parent_SKU__c, Currency__c,
+REV-34|ambiguous|PASS|accounts_revenue__c|true|12|34519|2|SELECT Parent_SKU__c, Currency__c, SUM(GP__c) totalGP, SUM(Revenue_Booked_Amount__c) totalRev
+REV-35|ambiguous|PASS|accounts_revenue__c|true|307|55851|2|SELECT Region__c, Cluster__c, Parent_SKU__c, Currency__c,
+REV-36|refuse|PASS||true|0|3915|0|NULL
+REV-37|refuse|PASS||true|0|3007|0|NULL
+REV-38|refuse|PASS||true|0|2289|0|NULL
+REV-39|refuse|FAIL||true|0|3481|0|NULL
+REV-40|refuse|FAIL||true|0|3049|0|NULL
+
+========== SUMMARY ==========
+Passed: 35/40
+Failed: 3/40
+Errors: 2/40
+=============================

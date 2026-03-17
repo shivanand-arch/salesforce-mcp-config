@@ -34,6 +34,78 @@ When asked about a "sector" (e.g., Retail, BFSI, Healthcare):
 - **NOT** `Account.Industry` or `Account.Cohort_Industry__c`
 - Sub-sector detail: use `Account.Sub_Cluster__c`
 
+## Pipeline / Funnel Stage Mapping (CRM Buddy Mapping Dictionary, Tableau-validated)
+
+When users ask about "pipeline", "funnel", "open funnel", "bookings", or "closed deals", map to these exact stage sets. This is the authoritative mapping from CRM Buddy's `AI_Mapping_Dictionary` table.
+
+| Concept (User Says) | Stages Included | Notes |
+|---------------------|----------------|-------|
+| **Pipeline** | Prospect, Approach, Proposal, Negotiation, SDF Submission, On Hold, Closed won - Pending, Order, Closed Unknown, Closed Duplicate, Closed-No decision, Closed Lost, POC Closed | Full lifecycle excluding Suspect, Rejected, SDF Rejected. Includes won+lost+open |
+| **Funnel** / **Total Funnel** | Prospect, Approach, Proposal, Negotiation, SDF Submission, On Hold, Closed won - Pending, POC, Order, Closed Unknown, Closed Duplicate, Closed-No decision, Closed Lost | Same as Pipeline but with POC instead of POC Closed |
+| **Open Funnel** | Prospect, Approach, Proposal, Negotiation, SDF Submission, On Hold, Closed won - Pending | Active pipeline — not yet won or lost |
+| **Closed** / **Closed Funnel** | Closed Unknown, Closed Duplicate, Closed-No decision, Closed Lost, POC Closed | All lost/abandoned stages |
+| **Order** / **Booking** | POC, Order | Won deals only (both POC and final Order) |
+
+**Key distinctions:**
+- "Pipeline" ≠ "Open Funnel" — Pipeline includes everything; Open Funnel is only active deals
+- POC is counted as both a won stage (Order/Booking) AND a funnel stage, but NOT as Pipeline
+- POC Closed is counted as Closed AND Pipeline, but NOT as Funnel
+- Suspect, Rejected, SDF Rejected are excluded from ALL concepts above
+
+## Slang / Abbreviation Mappings (CRM Buddy Mapping Dictionary)
+
+### Region Slang
+| User Says | Maps To (Database Value) |
+|-----------|------------------------|
+| Dom, Domestic | Domestic Enterprise |
+| Int | International |
+| Scaleup | Scaleup |
+| Internal | Internal |
+
+### Cluster Abbreviations
+| User Says | Maps To |
+|-----------|---------|
+| BI | Banking and Insurance |
+| FS | Financial Services |
+| Tech | Technology |
+| Marketplace | Marketplace |
+| Mobility | Mobility |
+| Partnerships | Partnerships |
+| Retail | Retail |
+| Services | Services |
+| Africa | Africa |
+| Romena | Romena |
+| APAC | APAC |
+| UAE | UAE |
+| US | US |
+| KSA | KSA |
+| SMB | SMB |
+| Mid Market | Mid Market |
+| Internal | Internal |
+
+### Parent SKU Slang
+| User Says | Maps To |
+|-----------|---------|
+| AI | Gen AI |
+| ECC | Contact Centre / Contact Center |
+
+### Deal Category Slang
+| User Says | Maps To |
+|-----------|---------|
+| Subscription, Subs, Sub | Subscription |
+| OT | One Time |
+
+### Voice Commit Deals
+| User Says | Maps To |
+|-----------|---------|
+| Commit Deal, Commit Deals, Commit | Voice Commit Deals |
+| Non Commit | Voice Non-Commit Deals |
+
+### Reversal Type
+| User Says | Maps To |
+|-----------|---------|
+| Reversals, Reversal | Partial Reversal, Reversal Reversal |
+
 ## Key Salesforce Objects & Fields
 
 ### Opportunity

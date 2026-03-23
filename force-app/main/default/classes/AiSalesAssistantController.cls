@@ -51,7 +51,7 @@ public with sharing class AiSalesAssistantController {
         'Object: accounts_revenue__c\n' +
         'Primary date field: Revenue_Booked_On__c (Date type, format YYYY-MM-DD)\n' +
         'Allowed measures: Revenue_Booked_Amount__c, GP__c, Variable_Cost__c, Fixed_Cost__c, Total_Cost__c, Norm_Rev_Amount__c\n' +
-        'Allowed dimensions: Cluster__c, Region__c, SKU__c, Parent_SKU__c, Product_Type__c, Classification__c, Revenue_Classification__c, Currency__c, Account__r.Name, Account_Manager__c, CSM__c\n' +
+        'Allowed dimensions: Cluster__c, Region__c, SKU__c, Parent_SKU__c, Product_Type__c, Classification__c, Revenue_Classification__c, Currency__c, Customer_Universal_Account__r.Name, Account_Manager__c, CSM__c\n' +
         'Parent_SKU__c values: Voice, Contact Centre, SMS, Whatsapp, Truecaller, Gen AI\n' +
         'SKU__c values: PF Voice, PF Others, PF Messaging SMS, Enterprise CC, PF Messaging Whatsapp, PF Voice CC, PF Others TC, Conversational AI, Voice Streaming, Chatbot, CQA, Voicebot, PF Messaging Others, PF Messaging RCS, VSIP\n' +
         'Cluster__c values: Africa, APAC, Banking and Insurance, BFSI & Strategic Large, Financial Services, FM Funded-I, FM Funded-II & Traditional-II, Internal, KSA, Marketplace, Mid Market, Mobility, Partnerships, Retail, Romena, Services, SMB, SME Funded, Technology, Traditional-I, UAE, US\n' +
@@ -1411,12 +1411,21 @@ public with sharing class AiSalesAssistantController {
         '    NOT for general pipeline queries.\n' +
         '\n' +
         'SLANG / ABBREVIATION MAPPINGS (CRM Buddy Mapping Dictionary):\n' +
-        '  Region: "Dom"/"Domestic" → Domestic Enterprise, "Int" → International\n' +
-        '  Cluster: "BI" → Banking and Insurance, "FS" → Financial Services, "Tech" → Technology\n' +
-        '  Parent SKU: "AI" → Gen AI, "ECC" → Contact Centre / Contact Center\n' +
+        '  Region: "Dom"/"Domestic" → Domestic Enterprise, "Int" → International, "Scaleup" → Scaleup\n' +
+        '  Cluster: "BI" → Banking and Insurance, "FS" → Financial Services, "Tech" → Technology, "Marketplace" → Marketplace\n' +
+        '  Parent SKU: "AI" → Gen AI, "ECC" → Contact Centre / Contact Center, "Voice" → Voice, "PF Voice" → PF Voice\n' +
+        '  Revenue SKU: "ECC" → Enterprise CC (SKU__c level on accounts_revenue__c)\n' +
         '  Deal Category: "Subs"/"Sub" → Subscription, "OT" → One Time\n' +
         '  Voice Commit: "Commit"/"Commit Deal" → Voice Commit Deals, "Non Commit" → Voice Non-Commit Deals\n' +
-        '  Reversal: "Reversals"/"Reversal" → includes Partial Reversal and Reversal Reversal\n\n' +
+        '  Reversal: "Reversals"/"Reversal" → includes Partial Reversal and Reversal Reversal\n' +
+        '  Revenue Classification: "Net New" → Revenue_Classification__c IN (Scaleup1, Scaleup2, Retention1, Retention2), "Organic" → Retention3\n' +
+        '  Churn: "Churn"/"Churned" → Is_Churned = TRUE (on revenue BigQuery — check Account.Account_Status__c = \'Churned\' in SOQL)\n' +
+        '  At Risk: "At Risk"/"Likely to churn" → Is_At_Risk = TRUE (check Account.RAG__c = \'RED\' in SOQL)\n' +
+        '  Margin: "GP Margin"/"Margin" = SUM(GP__c) / SUM(Revenue_Booked_Amount__c) — compute in summary, not SOQL\n' +
+        '  Time-period revenue slang: "MTD" = Month-to-Date, "QTD" = Quarter-to-Date, "LM" = Last Month,\n' +
+        '    "L3M"/"Last 3 Months" = prior 3 months, "L6M" = prior 6 months,\n' +
+        '    "R3M"/"Rolling 3 Months" = trailing 3 months incl current, "R6M"/"Rolling 6 Months" = trailing 6,\n' +
+        '    "R12M"/"Rolling 12 Months" = trailing 12 months. Translate these to Revenue_Booked_On__c date ranges.\n\n' +
         'AVERAGE DEAL SIZE: SUM(Normalize_Amount_INR__c)/COUNT(Id) for pipeline, SUM(Net_New_INR__c)/COUNT(Id) for bookings — compute in summary, not in SOQL.\n' +
         'SALES CYCLE: AVG of (CloseDate - CreatedDate) — SOQL cannot do date arithmetic. Fetch both dates, compute in summary.\n\n' +
         '=== MULTI-QUERY ANALYTICS ===\n' +
@@ -1494,6 +1503,8 @@ public with sharing class AiSalesAssistantController {
         '    Apex auto-splits this into H1 (Apr-Sep) + H2 (Oct-Mar) and merges results.\n' +
         '    ALWAYS use GROUP BY with SUM/COUNT aggregates.\n' +
         '    NEVER write detail-level SELECT — it WILL crash.\n' +
+        '    ⚠️ DATE FILTER RULE: Use EXACTLY ONE date range pair: Revenue_Booked_On__c >= start AND Revenue_Booked_On__c <= end.\n' +
+        '    NEVER add a second/redundant Revenue_Booked_On__c filter. The FY range is sufficient — no extra lookback needed.\n' +
         '    ⚠️ THIS RULE APPLIES TO ALL VALUE FIELDS: Revenue_Booked_Amount__c, GP__c, Variable_Cost__c, Fixed_Cost__c, Total_Cost__c.\n' +
         '  CURRENCY NOTE: Revenue_Booked_Amount__c AND GP__c are in NATIVE currency (INR for domestic, USD for intl).\n' +
         '    Tableau converts USD×80 for "Actual" view. For cross-region totals, ALWAYS include Currency__c in SELECT\n' +
@@ -1888,7 +1899,7 @@ public with sharing class AiSalesAssistantController {
         '  GP value: GP__c. GP margin: GP__c / Revenue_Booked_Amount__c.\n' +
         '  Cost fields: Variable_Cost__c, Fixed_Cost__c, Total_Cost__c.\n' +
         '  Filter by: Parent_SKU__c, SKU__c, Cluster__c, Region__c, AOP_Category__c.\n' +
-        '  "Top customers by GP" → GROUP BY Account__r.Name, SKU__c (Tableau shows Account × SKU rankings).\n' +
+        '  "Top customers by GP" → GROUP BY Customer_Universal_Account__r.Name, SKU__c (use Universal Account, NOT Account__r.Name).\n' +
         '  GPR (Gross Profit Retention): Same as NRR/GRR but using GP__c instead of Revenue.\n' +
         '  GP__c is in NATIVE currency — include Currency__c in SELECT for cross-region totals.\n\n' +
         'PENETRATION INDEX — from Tableau Penetration Index dashboard:\n' +
@@ -2080,7 +2091,7 @@ public with sharing class AiSalesAssistantController {
         '  - If a dimension appears in one query but not the other, flag it (e.g., "No won deals in this cluster").\n' +
         '  - For cross-object queries (e.g., Opportunity + accounts_revenue__c), explain how the datasets relate.\n' +
         '  H1/H2 MERGE FOR RANKINGS: When queries are split by time period (H1=Apr-Sep, H2=Oct-Mar):\n' +
-        '    - MUST merge H1+H2 data by matching dimension keys (Account__r.Name×SKU__c, or Cluster__c, etc.).\n' +
+        '    - MUST merge H1+H2 data by matching dimension keys (Customer_Universal_Account__r.Name×SKU__c, or Cluster__c, etc.).\n' +
         '    - Sum values across periods BEFORE ranking. A customer in both H1 and H2 gets their totals added.\n' +
         '    - A customer appearing only in H1 or only in H2 still counts — use their single-period value.\n' +
         '    - NEVER rank based on just one half. The final ranking MUST reflect the full year.\n' +
@@ -2586,6 +2597,12 @@ public with sharing class AiSalesAssistantController {
             // Capture the SOQL parts before and after the date range
             String beforeDates = soql.substring(0, dateMatcher.start());
             String afterDates = soql.substring(dateMatcher.end());
+
+            // Strip any redundant Revenue_Booked_On__c filters that Claude may have added
+            // (e.g., "AND Revenue_Booked_On__c >= 2024-03-23" as a rogue lookback filter)
+            afterDates = afterDates.replaceAll(
+                '(?i)\\s+AND\\s+Revenue_Booked_On__c\\s*(>=|<=|>|<|=)\\s*\\d{4}-\\d{2}-\\d{2}', ''
+            );
 
             Date chunkStart = startDate;
             Integer chunkIndex = 1;

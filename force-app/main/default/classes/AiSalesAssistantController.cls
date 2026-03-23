@@ -86,7 +86,7 @@ public with sharing class AiSalesAssistantController {
         'Rules:\n' +
         '- ALWAYS include dateFilter with explicit start/end dates.\n' +
         '- For "top N" questions: set intent=ranking, limit=2000 (summary truncates), sort DESC on measure alias.\n' +
-        '- For customer rankings: use Account__r.Name dimension and add filter {"field":"Account__c","op":"!=","value":null}.\n' +
+        '- For customer rankings: use Customer_Universal_Account__r.Name dimension and add filter {"field":"Customer_Universal_Account__c","op":"!=","value":null}.\n' +
         '- Include Currency__c dimension when data spans multiple currencies.\n' +
         '- Use BETWEEN op only in dateFilter; use IN op for picklist multi-value filters.\n' +
         '- detail intent is NOT allowed for accounts_revenue__c (too many rows). Use aggregate or ranking.\n' +
@@ -102,8 +102,8 @@ public with sharing class AiSalesAssistantController {
         'Q: "Top customers by GP in Q3"\n' +
         '{"domain":"revenue","intent":"ranking","object":"accounts_revenue__c",' +
         '"measures":[{"fn":"SUM","field":"GP__c","alias":"gp"}],' +
-        '"dimensions":["Account__r.Name","SKU__c","Cluster__c","Currency__c"],' +
-        '"filters":[{"field":"Account__c","op":"!=","value":null}],' +
+        '"dimensions":["Customer_Universal_Account__r.Name","SKU__c","Cluster__c","Currency__c"],' +
+        '"filters":[{"field":"Customer_Universal_Account__c","op":"!=","value":null}],' +
         '"dateFilter":{"field":"Revenue_Booked_On__c","start":"2025-10-01","end":"2025-12-31"},' +
         '"sort":{"field":"gp","direction":"DESC"},"limit":2000}\n\n' +
         'Q: "How many bookings this quarter?"\n' +
@@ -211,12 +211,13 @@ public with sharing class AiSalesAssistantController {
         // Validate filters
         List<Object> filters = (List<Object>) plan.get('filters');
         if (filters != null) {
-            // Build combined allowlist: measures + dimensions + date field + Account__c (for null check)
+            // Build combined allowlist: measures + dimensions + date field + account lookups (for null check)
             Set<String> allowedFilterFields = new Set<String>();
             allowedFilterFields.addAll(allowedMeasures);
             allowedFilterFields.addAll(allowedDimensions);
             allowedFilterFields.add('revenue_booked_on__c');
             allowedFilterFields.add('account__c');
+            allowedFilterFields.add('customer_universal_account__c');
 
             for (Object fObj : filters) {
                 Map<String, Object> f = (Map<String, Object>) fObj;
@@ -1497,27 +1498,29 @@ public with sharing class AiSalesAssistantController {
         '  CURRENCY NOTE: Revenue_Booked_Amount__c AND GP__c are in NATIVE currency (INR for domestic, USD for intl).\n' +
         '    Tableau converts USD×80 for "Actual" view. For cross-region totals, ALWAYS include Currency__c in SELECT\n' +
         '    and let the summary step apply conversion (1 USD=83 INR, 1 AED=23 INR).\n' +
-        '  CUSTOMER RANKING: For "top customers" queries, use Account__r.Name (NOT Customer_Name__c).\n' +
-        '    ⚠️ CRITICAL: Customer_Name__c is NULL for many records (especially recent months). ALWAYS use Account__r.Name.\n' +
-        '    GROUP BY Account__r.Name AND SKU__c — Tableau breaks rankings by Account Name × SKU.\n' +
-        '    Add "Account__c != null" in WHERE to exclude orphan records.\n' +
+        '  CUSTOMER RANKING: For "top customers" queries, use Customer_Universal_Account__r.Name (NOT Account__r.Name, NOT Customer_Name__c).\n' +
+        '    ⚠️ CRITICAL: Account__c is the Setup/Tenant account (7,887 records). Customer_Universal_Account__c is the\n' +
+        '    Universal Customer Account (6,231 records) that properly rolls up multiple setups/tenants into one customer.\n' +
+        '    ALWAYS use Customer_Universal_Account__r.Name for customer-level aggregation.\n' +
+        '    GROUP BY Customer_Universal_Account__r.Name AND SKU__c — Tableau breaks rankings by Customer × SKU.\n' +
+        '    Add "Customer_Universal_Account__c != null" in WHERE to exclude orphan records.\n' +
         '    Also include Cluster__c, Currency__c in SELECT for context.\n' +
         '    NOTE: You can generate a SINGLE full-year query — Apex auto-splits into H1/H2 chunks.\n' +
         '    Example — "top 10 customers by GP":\n' +
         '    ```soql\n' +
-        '    SELECT Account__r.Name acctName, SKU__c, Cluster__c, Currency__c, SUM(GP__c) gp\n' +
+        '    SELECT Customer_Universal_Account__r.Name acctName, SKU__c, Cluster__c, Currency__c, SUM(GP__c) gp\n' +
         '    FROM accounts_revenue__c\n' +
         '    WHERE Revenue_Booked_On__c >= 2025-04-01 AND Revenue_Booked_On__c <= 2026-03-31\n' +
-        '    AND Account__c != null\n' +
-        '    GROUP BY Account__r.Name, SKU__c, Cluster__c, Currency__c\n' +
+        '    AND Customer_Universal_Account__c != null\n' +
+        '    GROUP BY Customer_Universal_Account__r.Name, SKU__c, Cluster__c, Currency__c\n' +
         '    ORDER BY SUM(GP__c) DESC LIMIT 2000\n' +
         '    ```\n' +
-        '    Apex auto-splits this into H1 (Apr-Sep) + H2 (Oct-Mar). Summary merges by Account__r.Name×SKU__c.\n' +
+        '    Apex auto-splits this into H1 (Apr-Sep) + H2 (Oct-Mar). Summary merges by Customer_Universal_Account__r.Name×SKU__c.\n' +
         '  Date Field: Revenue_Booked_On__c\n' +
         '  Cluster/Sector: Cluster__c (directly on this object)\n' +
         '  Other fields: SKU__c, Products__c, Region__c, Classification__c,\n' +
-        '    Revenue_Classification__c, Account__c(lookup), Customer_Name__c,\n' +
-        '    CSM__c(lookup), Account_Manager__c(lookup), Norm_Rev_Amount__c,\n' +
+        '    Revenue_Classification__c, Account__c(Setup/Tenant lookup), Customer_Universal_Account__c(Universal Customer lookup — USE THIS for customer rollups),\n' +
+        '    Customer_Name__c(string — often NULL, avoid), CSM__c(lookup), Account_Manager__c(lookup), Norm_Rev_Amount__c,\n' +
         '    Product_Type__c, AOP_Category__c, Revenue_Attribution__c,\n' +
         '    Variable_Cost__c, Fixed_Cost__c, Total_Cost__c, GP__c,\n' +
         '    Parent_SKU__c, Rev_Source__c, Rev_Sub_Source__c, Currency__c\n' +
@@ -1748,6 +1751,11 @@ public with sharing class AiSalesAssistantController {
         '  Issue category breakdown: GROUP BY Account.Name + Issue_Category__c\n' +
         '  SLA analysis: Overall_SLA__c, SLA_Violated__c, SLA_Violation_Reason__c\n\n' +
         '=== ACCOUNT (249 fields) ===\n' +
+        '⚠️ MANDATORY RULE: When user asks about "accounts", "customers", "customer details", ALWAYS filter by\n' +
+        '  RecordType.Name = \'Customer Account\'. This is the ONLY record type that represents actual customers.\n' +
+        '  Other record types (Setup Account, Tenant Account, PF Account, Group Account, Prospect Account, AI Account,\n' +
+        '  Partnership Account) are internal/operational records and must NOT be shown unless user explicitly requests them.\n' +
+        '  If no Customer Account exists for a query, tell the user: "I couldn\'t find a Customer Account for this."\n\n' +
         'Standard: Id, Name, Type, Industry, OwnerId, ParentId, Website, Phone, CreatedDate,\n' +
         '  LastModifiedDate, CurrencyIsoCode, RecordTypeId, AnnualRevenue, NumberOfEmployees,\n' +
         '  Description, BillingCity, BillingState, BillingCountry\n\n' +

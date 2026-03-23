@@ -41,7 +41,7 @@
     </values>
     <values>
         <field>AllowedDimensions__c</field>
-        <value xsi:type="xsd:string">Cluster__c,Region__c,SKU__c,Parent_SKU__c,Product_Type__c,Classification__c,Revenue_Classification__c,Currency__c,Account__r.Name,Account_Manager__c,CSM__c</value>
+        <value xsi:type="xsd:string">Cluster__c,Region__c,SKU__c,Parent_SKU__c,Product_Type__c,Classification__c,Revenue_Classification__c,Currency__c,Account__r.Name,Customer_Universal_Account__r.Name,Account_Manager__c,CSM__c</value>
     </values>
     <values>
         <field>DomainKeywords__c</field>

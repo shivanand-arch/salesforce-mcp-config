@@ -51,16 +51,18 @@ public with sharing class AiSalesAssistantController {
         'Object: accounts_revenue__c\n' +
         'Primary date field: Revenue_Booked_On__c (Date type, format YYYY-MM-DD)\n' +
         'Allowed measures: Revenue_Booked_Amount__c, GP__c, Variable_Cost__c, Fixed_Cost__c, Total_Cost__c, Norm_Rev_Amount__c\n' +
-        'Allowed dimensions: Cluster__c, Region__c, SKU__c, Parent_SKU__c, Product_Type__c, Classification__c, Revenue_Classification__c, Currency__c, Customer_Universal_Account__r.Name, Account_Manager__c, CSM__c\n' +
+        'Allowed dimensions: Customer_Universal_Account__r.Cluster__c, Customer_Universal_Account__r.Region__c, SKU__c, Parent_SKU__c, Product_Type__c, Classification__c, Revenue_Classification__c, Currency__c, Customer_Universal_Account__r.Name, Account_Manager__c, CSM__c\n' +
         'Parent_SKU__c values: Voice, Contact Centre, SMS, Whatsapp, Truecaller, Gen AI\n' +
         'SKU__c values: PF Voice, PF Others, PF Messaging SMS, Enterprise CC, PF Messaging Whatsapp, PF Voice CC, PF Others TC, Conversational AI, Voice Streaming, Chatbot, CQA, Voicebot, PF Messaging Others, PF Messaging RCS, VSIP\n' +
-        'Cluster__c values: Africa, APAC, Banking and Insurance, BFSI & Strategic Large, Financial Services, FM Funded-I, FM Funded-II & Traditional-II, Internal, KSA, Marketplace, Mid Market, Mobility, Partnerships, Retail, Romena, Services, SMB, SME Funded, Technology, Traditional-I, UAE, US\n' +
-        'Region__c values: International, Scaleup, Domestic Enterprise\n' +
+        'Customer_Universal_Account__r.Cluster__c values: Africa, APAC, Banking and Insurance, Financial Services, Internal, KSA, Marketplace, Mid Market, Mobility, Partnerships, Retail, Romena, Services, SMB, Technology, UAE, US\n' +
+        'Customer_Universal_Account__r.Region__c values: International, Scaleup, Domestic Enterprise, Internal\n' +
         'CRITICAL — Region vs Cluster disambiguation:\n' +
-        '  "Scaleup"/"Scaleups"/"Scale" → filter on Region__c = \'Scaleup\', NOT Cluster__c.\n' +
-        '  "Domestic"/"International" → filter on Region__c, NOT Cluster__c.\n' +
-        '  "BFSI"/"Retail"/"APAC"/"SME"/"Technology" etc. → filter on Cluster__c, NOT Region__c.\n' +
-        '  Region__c and Cluster__c have COMPLETELY DIFFERENT value sets. Never confuse them.\n' +
+        '  ALWAYS use Customer_Universal_Account__r fields, NOT Cluster__c/Region__c directly on revenue record.\n' +
+        '  "Scaleup"/"Scaleups"/"Scale" → Customer_Universal_Account__r.Region__c = \'Scaleup\'.\n' +
+        '  "Domestic"/"International" → Customer_Universal_Account__r.Region__c.\n' +
+        '  "BFSI"/"Retail"/"APAC"/"SME"/"Technology" etc. → Customer_Universal_Account__r.Cluster__c.\n' +
+        '  Region and Cluster have COMPLETELY DIFFERENT value sets. Never confuse them.\n' +
+        '  ALWAYS add Customer_Universal_Account__c != null in WHERE.\n' +
         'Revenue_Classification__c: Recurring, Non-Recurring\n' +
         'Classification__c: New Sales, Cross sell, Up sell, AMC Renewal\n' +
         'Currency__c values: INR, USD, AED\n' +
@@ -68,8 +70,8 @@ public with sharing class AiSalesAssistantController {
         '<fiscal_rules>\n' +
         'Indian FY runs Apr-Mar. FY2025 = Apr 2025 - Mar 2026.\n' +
         'Q1=Apr-Jun, Q2=Jul-Sep, Q3=Oct-Dec, Q4=Jan-Mar.\n' +
-        '"This year"/"current year" = current Indian FY (Apr 1 to today).\n' +
-        'No date specified = current FY (Apr 1 to today).\n' +
+        '"This year"/"current year" = current Indian FY (Apr 1 to end of last complete month). Revenue loads monthly.\n' +
+        'No date specified = current FY (Apr 1 to end of last complete month). In March 2026 → end = 2026-02-28.\n' +
         '</fiscal_rules>\n\n' +
         '<instructions>\n' +
         'Analyze the question and return a JSON plan.\n' +
@@ -97,7 +99,7 @@ public with sharing class AiSalesAssistantController {
         '"measures":[{"fn":"SUM","field":"Revenue_Booked_Amount__c","alias":"rev"}],' +
         '"dimensions":["Cluster__c","Currency__c"],' +
         '"filters":[],' +
-        '"dateFilter":{"field":"Revenue_Booked_On__c","start":"2025-04-01","end":"2026-03-14"},' +
+        '"dateFilter":{"field":"Revenue_Booked_On__c","start":"2025-04-01","end":"2026-02-28"},' +
         '"sort":{"field":"rev","direction":"DESC"},"limit":2000}\n\n' +
         'Q: "Top customers by GP in Q3"\n' +
         '{"domain":"revenue","intent":"ranking","object":"accounts_revenue__c",' +
@@ -1336,7 +1338,7 @@ public with sharing class AiSalesAssistantController {
         '7. Formula fields CANNOT be used in GROUP BY, aggregate WHERE, or ORDER BY in aggregates.\n' +
         '8. Multi-picklist: MUST use INCLUDES/EXCLUDES infix, NEVER as function. NEVER use LIKE on multi-picklist.\n\n' +
         '=== QUERY PHILOSOPHY ===\n' +
-        '- DEFAULT TIME: No date specified → current FY (April 1 to today). Leads/Cases use CreatedDate.\n' +
+        '- DEFAULT TIME: No date specified → current FY (April 1 to March 31). Use FULL FY boundaries, NOT today. Leads/Cases use CreatedDate.\n' +
         '  e.g. March 2026 → CloseDate >= 2025-04-01; June 2026 → CloseDate >= 2026-04-01\n' +
         '- Specified range: add 30-day buffer both sides.\n' +
         '- Prefer >= for thresholds ("above 2 lakhs" = >= 200000).\n' +
@@ -1347,22 +1349,29 @@ public with sharing class AiSalesAssistantController {
         'Indian FY (Apr-Mar): Q1=Apr-Jun, Q2=Jul-Sep, Q3=Oct-Dec, Q4=Jan-Mar.\n' +
         'FY2025=Apr 2025-Mar 2026, FY2026=Apr 2026-Mar 2027.\n' +
         'ALWAYS use explicit date ranges for FY/quarters, NEVER SOQL fiscal literals. LAST_N_DAYS is OK.\n' +
-        '"This year"/"this FY"/"current year" → ALWAYS means current Indian FY (Apr 1 to today).\n' +
-        '  In March 2026 → FY2025 = CloseDate >= 2025-04-01 AND CloseDate <= 2026-03-31.\n' +
+        '"This year"/"this FY"/"current year" → ALWAYS means current Indian FY.\n' +
+        '  ⚠️ FY END DATE DEPENDS ON OBJECT:\n' +
+        '    accounts_revenue__c (revenue/GP): FY end = LAST DAY OF PREVIOUS COMPLETE MONTH.\n' +
+        '      Revenue data loads monthly. Current month may have stray/incomplete records.\n' +
+        '      In March 2026 → last complete month = Feb → Revenue_Booked_On__c <= 2026-02-28\n' +
+        '      In April 2026 → last complete month = Mar → Revenue_Booked_On__c <= 2026-03-31\n' +
+        '      Formula: end date = first day of current month minus 1 day.\n' +
+        '    Opportunity (bookings/pipeline/win rate): FY end = Mar 31 (deals have future CloseDate/B_Deal_Date).\n' +
+        '      March 2026 → CloseDate >= 2025-04-01 AND CloseDate <= 2026-03-31\n' +
         '  NEVER interpret "this year" as calendar year (Jan-Dec). India runs on fiscal year.\n\n' +
         '=== COMPUTED METRICS (require specific SOQL patterns) ===\n' +
         'WIN RATE: "win rate"/"conversion rate"/"success rate" across any dimension.\n' +
         '  Definition (Tableau-validated, Key KPIs dashboard): Won value / Total consumed value.\n' +
         '  Won stage: StageName = \'Order\'\n' +
-        '  Won date field: B_Deal_Date__c (booking date, NOT CloseDate)\n' +
+        '  Won date field: CloseDate\n' +
         '  Consumed stages: Terminal stages PLUS Negotiation (deals that reached pricing/terms stage):\n' +
         '    StageName IN (\'Order\',\'Negotiation\',\'Closed Lost\',\'Closed-No decision\',\'Closed Unknown\',\'Closed Duplicate\',\'Rejected\',\'SDF Rejected\')\n' +
         '  Consumed date field: CloseDate\n' +
         '  Value field: Amount for BOTH won and consumed. NOT Net_New_INR__c (it is 0 for lost deals).\n' +
         '  CRITICAL: You MUST include StageName in both SELECT and GROUP BY so the summary can split won vs total.\n' +
-        '  CRITICAL: Generate TWO queries — one for won (filtered by B_Deal_Date__c), one for all consumed (filtered by CloseDate).\n' +
+        '  CRITICAL: Generate TWO queries — one for won (filtered by CloseDate), one for all consumed (filtered by CloseDate).\n' +
         '    Query 1 (Won): SELECT Account_Cluster__c, SUM(Amount) wonVal, COUNT(Id) wonCnt\n' +
-        '      FROM Opportunity WHERE StageName = \'Order\' AND B_Deal_Date__c >= 2025-04-01 AND B_Deal_Date__c <= 2026-03-31\n' +
+        '      FROM Opportunity WHERE StageName = \'Order\' AND CloseDate >= 2025-04-01 AND CloseDate <= 2026-03-31\n' +
         '      GROUP BY Account_Cluster__c ORDER BY SUM(Amount) DESC LIMIT 2000\n' +
         '    Query 2 (Consumed): SELECT Account_Cluster__c, StageName, SUM(Amount) consVal, COUNT(Id) consCnt\n' +
         '      FROM Opportunity WHERE StageName IN (\'Order\',\'Negotiation\',\'Closed Lost\',\'Closed-No decision\',\'Closed Unknown\',\'Closed Duplicate\',\'Rejected\',\'SDF Rejected\')\n' +
@@ -1493,12 +1502,13 @@ public with sharing class AiSalesAssistantController {
         '  ⚠️ GOVERNOR LIMIT (CRITICAL): ~8,000 records/month, 100K+/year. Apex limit = 50K rows/transaction.\n' +
         '    RULE: Apex AUTO-SPLITS queries spanning >6 months into H1/H2 chunks.\n' +
         '    You can write a SINGLE full-year query — Apex handles the split automatically.\n' +
-        '    Example for "revenue this year" (FY2026 = Apr 2025 - Mar 2026):\n' +
+        '    Example for "revenue this year" (FY2026, in March 2026 → end = 2026-02-28):\n' +
         '    ```soql\n' +
-        '    SELECT Cluster__c, SUM(Revenue_Booked_Amount__c) rev\n' +
+        '    SELECT Customer_Universal_Account__r.Cluster__c cluster, SUM(Revenue_Booked_Amount__c) rev\n' +
         '    FROM accounts_revenue__c\n' +
-        '    WHERE Revenue_Booked_On__c >= 2025-04-01 AND Revenue_Booked_On__c <= 2026-03-31\n' +
-        '    GROUP BY Cluster__c\n' +
+        '    WHERE Revenue_Booked_On__c >= 2025-04-01 AND Revenue_Booked_On__c <= 2026-02-28\n' +
+        '    AND Customer_Universal_Account__c != null\n' +
+        '    GROUP BY Customer_Universal_Account__r.Cluster__c\n' +
         '    ```\n' +
         '    Apex auto-splits this into H1 (Apr-Sep) + H2 (Oct-Mar) and merges results.\n' +
         '    ALWAYS use GROUP BY with SUM/COUNT aggregates.\n' +
@@ -1506,27 +1516,40 @@ public with sharing class AiSalesAssistantController {
         '    ⚠️ DATE FILTER RULE: Use EXACTLY ONE date range pair: Revenue_Booked_On__c >= start AND Revenue_Booked_On__c <= end.\n' +
         '    NEVER add a second/redundant Revenue_Booked_On__c filter. The FY range is sufficient — no extra lookback needed.\n' +
         '    ⚠️ THIS RULE APPLIES TO ALL VALUE FIELDS: Revenue_Booked_Amount__c, GP__c, Variable_Cost__c, Fixed_Cost__c, Total_Cost__c.\n' +
-        '  CURRENCY NOTE: Revenue_Booked_Amount__c AND GP__c are in NATIVE currency (INR for domestic, USD for intl).\n' +
-        '    Tableau converts USD×80 for "Actual" view. For cross-region totals, ALWAYS include Currency__c in SELECT\n' +
-        '    and let the summary step apply conversion (1 USD=83 INR, 1 AED=23 INR).\n' +
+        '  CURRENCY NOTE: Revenue_Booked_Amount__c AND GP__c are in NATIVE currency (INR for domestic, USD/AED for intl).\n' +
+        '    ⚠️ CRITICAL CURRENCY RULE:\n' +
+        '    INTERNATIONAL CLUSTERS (have USD/AED revenue): APAC, Africa, Africa Others, Romena, Romena Others, US, KSA, KSA Others, UAE.\n' +
+        '    ALL OTHER CLUSTERS are 100% INR — currency conversion is irrelevant for them.\n' +
+        '    WHEN TO INCLUDE Currency__c IN GROUP BY:\n' +
+        '      ✅ CUSTOMER RANKING queries (top N customers) — need to convert and rank across currencies.\n' +
+        '      ✅ Queries filtered to an INTERNATIONAL cluster (APAC, Africa, Romena, US, KSA, UAE) — values may be USD/AED.\n' +
+        '      ✅ User explicitly asks about currency breakdown or "in INR".\n' +
+        '    WHEN NOT TO INCLUDE Currency__c:\n' +
+        '      ❌ Aggregate by cluster/region (revenue by cluster, GP by region) — splits clusters into INR/USD rows, inflates totals.\n' +
+        '      ❌ Domestic-only queries — everything is INR.\n' +
+        '      ❌ Total revenue/GP queries — just SUM raw values.\n' +
+        '    DEFAULT: Do NOT include Currency__c. Only add it for customer rankings or international-specific queries.\n' +
+        '    CONVERSION RATES (when Currency__c IS in results): 1 USD=83 INR, 1 AED=23 INR.\n' +
         '  CUSTOMER RANKING: For "top customers" queries, use Customer_Universal_Account__r.Name (NOT Account__r.Name, NOT Customer_Name__c).\n' +
         '    ⚠️ CRITICAL: Account__c is the Setup/Tenant account (7,887 records). Customer_Universal_Account__c is the\n' +
         '    Universal Customer Account (6,231 records) that properly rolls up multiple setups/tenants into one customer.\n' +
         '    ALWAYS use Customer_Universal_Account__r.Name for customer-level aggregation.\n' +
-        '    GROUP BY Customer_Universal_Account__r.Name AND SKU__c — Tableau breaks rankings by Customer × SKU.\n' +
+        '    ⚠️ SIMPLE TOP-N RULE: "Top 10 customers by revenue/GP" → GROUP BY ONLY Customer_Universal_Account__r.Name + Currency__c.\n' +
+        '      Do NOT add SKU__c, Cluster__c to GROUP BY — that splits one customer into many rows and breaks ranking.\n' +
+        '      CRM Buddy groups by AccountName only. Match that pattern.\n' +
+        '    Only add SKU__c to GROUP BY when user explicitly asks for product breakdown (e.g., "top customers by revenue per SKU").\n' +
         '    Add "Customer_Universal_Account__c != null" in WHERE to exclude orphan records.\n' +
-        '    Also include Cluster__c, Currency__c in SELECT for context.\n' +
         '    NOTE: You can generate a SINGLE full-year query — Apex auto-splits into H1/H2 chunks.\n' +
-        '    Example — "top 10 customers by GP":\n' +
+        '    Example — "top 10 customers by revenue":\n' +
         '    ```soql\n' +
-        '    SELECT Customer_Universal_Account__r.Name acctName, SKU__c, Cluster__c, Currency__c, SUM(GP__c) gp\n' +
+        '    SELECT Customer_Universal_Account__r.Name acctName, Currency__c, SUM(Revenue_Booked_Amount__c) rev\n' +
         '    FROM accounts_revenue__c\n' +
         '    WHERE Revenue_Booked_On__c >= 2025-04-01 AND Revenue_Booked_On__c <= 2026-03-31\n' +
         '    AND Customer_Universal_Account__c != null\n' +
-        '    GROUP BY Customer_Universal_Account__r.Name, SKU__c, Cluster__c, Currency__c\n' +
-        '    ORDER BY SUM(GP__c) DESC LIMIT 2000\n' +
+        '    GROUP BY Customer_Universal_Account__r.Name, Currency__c\n' +
+        '    ORDER BY SUM(Revenue_Booked_Amount__c) DESC LIMIT 2000\n' +
         '    ```\n' +
-        '    Apex auto-splits this into H1 (Apr-Sep) + H2 (Oct-Mar). Summary merges by Customer_Universal_Account__r.Name×SKU__c.\n' +
+        '    Apex auto-splits this into H1 (Apr-Sep) + H2 (Oct-Mar). Summary merges by Customer_Universal_Account__r.Name, converts currencies, then ranks.\n' +
         '  Date Field: Revenue_Booked_On__c\n' +
         '  Cluster/Sector: Cluster__c (directly on this object)\n' +
         '  Other fields: SKU__c, Products__c, Region__c, Classification__c,\n' +
@@ -1552,31 +1575,33 @@ public with sharing class AiSalesAssistantController {
         '** SOURCE 2 - ORDER BOOKINGS (for "bookings", "deals won", "order value"): **\n' +
         '  Object: Opportunity\n' +
         '  Stage Filter: StageName IN (\'Order\',\'POC\')\n' +
-        '  Date Field: B_Deal_Date__c (NOT CloseDate)\n' +
+        '  Date Field: CloseDate (standard Salesforce field — matches CRM Buddy/Tableau booking date)\n' +
         '  Value Field: Net_New_INR__c (formula, already in INR)\n' +
-        '  DEDUP FIELD: Opportunity_Line_Item_Count__c — count of OpportunityLineItems per Opp.\n' +
-        '    17% of won deals have multiple line items, inflating raw SUM by ~22%.\n' +
-        '    ALWAYS include Opportunity_Line_Item_Count__c in SELECT for booking queries.\n' +
-        '    The summary step will divide each deal\'s value by its line item count before summing.\n' +
-        '  REVERSAL FILTER: Exclude Net_New_INR__c < 0 deals (reversals) from booking totals.\n' +
-        '    Add: AND Net_New_INR__c >= 0 to all booking aggregation queries.\n' +
-        '    37 reversal deals in FY25 = -1.1 Cr that Tableau excludes.\n' +
-        '  TABLEAU MATCHING: To match Tableau dashboard values:\n' +
-        '    1. Include Opportunity_Line_Item_Count__c in SELECT (cannot GROUP BY — it\'s a formula)\n' +
-        '    2. Add AND Net_New_INR__c >= 0 to exclude reversals\n' +
-        '    3. Summary step: for each deal, use Net_New_INR__c / Opportunity_Line_Item_Count__c\n' +
-        '    4. Remaining ~5% gap is due to currency rate differences (Tableau uses USD=85, SF formula varies)\n\n' +
+        '  ⚠️ NO DEDUP NEEDED: Net_New_INR__c is a per-Opportunity formula that already gives the correct value.\n' +
+        '    SUM(Net_New_INR__c) gives the correct booking total. Do NOT divide by line item count.\n' +
+        '    Do NOT include Opportunity_Line_Item_Count__c — it causes incorrect "adjusted" values.\n' +
+        '  REVERSAL FILTER: Do NOT exclude negative Net_New_INR__c values by default.\n' +
+        '    Reversals (negative amounts) are part of the net booking total. Include them.\n' +
+        '    Only filter reversals if user explicitly asks to exclude them.\n\n' +
         'DEFAULT: Use accounts_revenue__c for revenue questions unless user\n' +
         '  specifically asks about deals/bookings/pipeline/opportunities.\n' +
-        'SECTOR queries: Use Cluster__c on accounts_revenue__c, or Account_Cluster__c on Opportunity.\n' +
-        '⚠️ REGION vs CLUSTER DISAMBIGUATION (critical — gets confused often):\n' +
-        '  Region__c has ONLY 3 values: International, Scaleup, Domestic Enterprise.\n' +
-        '  Cluster__c has 22 values: BFSI, SME Funded, Technology, Retail, APAC, UAE, etc.\n' +
-        '  "Scaleup"/"Scaleups"/"Scale" → ALWAYS filter Region__c = \'Scaleup\', NEVER Cluster__c.\n' +
-        '  "Domestic"/"Dom" → ALWAYS filter Region__c = \'Domestic Enterprise\', NEVER Cluster__c.\n' +
-        '  "International"/"Intl" → ALWAYS filter Region__c = \'International\', NEVER Cluster__c.\n' +
-        '  "BFSI"/"Retail"/"APAC"/"SME"/"Technology"/etc. → filter Cluster__c, NEVER Region__c.\n' +
-        '  RULE: If the user\'s term matches a Region__c value, use Region__c. If it matches a Cluster__c value, use Cluster__c. Never swap them.\n\n' +
+        '⚠️ UNIVERSAL ACCOUNT RULE FOR REVENUE (accounts_revenue__c):\n' +
+        '  ALWAYS use Customer_Universal_Account__r fields for Cluster and Region grouping/filtering:\n' +
+        '    Cluster → Customer_Universal_Account__r.Cluster__c (NOT Cluster__c directly on revenue record)\n' +
+        '    Region → Customer_Universal_Account__r.Region__c (NOT Region__c or Account_Region__c on revenue record)\n' +
+        '  The direct Cluster__c/Region__c on accounts_revenue__c come from the Setup/Tenant account — they differ from the\n' +
+        '  Universal Account by ₹1-3 Cr per cluster due to setup/tenant ≠ customer mapping.\n' +
+        '  ALWAYS add Customer_Universal_Account__c != null in WHERE when using UA fields.\n' +
+        '  ON Opportunity: Use Account_Cluster__c and Account_Region__c (these come from the Account directly).\n' +
+        'REGION vs CLUSTER DISAMBIGUATION (critical — gets confused often):\n' +
+        '  Region has ONLY 3+1 values: International, Scaleup, Domestic Enterprise, Internal.\n' +
+        '  Cluster has 22 values: Banking and Insurance, Financial Services, Technology, Retail, APAC, UAE, etc.\n' +
+        '  "Scaleup"/"Scaleups"/"Scale" → Region = \'Scaleup\', NEVER Cluster.\n' +
+        '  "Domestic"/"Dom" → Region = \'Domestic Enterprise\', NEVER Cluster.\n' +
+        '  "International"/"Intl" → Region = \'International\', NEVER Cluster.\n' +
+        '  "BFSI"/"Retail"/"APAC"/"SME"/"Technology"/etc. → Cluster, NEVER Region.\n' +
+        '  On accounts_revenue__c: use Customer_Universal_Account__r.Region__c and Customer_Universal_Account__r.Cluster__c.\n' +
+        '  On Opportunity: use Account_Region__c and Account_Cluster__c.\n\n' +
         '=== OPPORTUNITY (341 fields) ===\n' +
         'Standard: Id, Name, AccountId, OwnerId, StageName, Amount, CloseDate, CreatedDate,\n' +
         '  LastModifiedDate, IsClosed, IsWon, Probability, Type, LeadSource, Description,\n' +
@@ -1599,7 +1624,7 @@ public with sharing class AiSalesAssistantController {
         'Multi-Picklist (MUST use INCLUDES): Product_Type__c, Type_of_Solution__c, Competition__c,\n' +
         '  CRM_3rd_Party__c, PBX_Integration__c, Custom_use_cases__c, Pricing_Model__c,\n' +
         '  Setups__c, Lead_Products__c\n' +
-        'Date: B_Deal_Date__c(Booking date - USE FOR REVENUE QUERIES), Deployment_Date__c,\n' +
+        'Date: CloseDate(Booking/won date — USE FOR BOOKING QUERIES), B_Deal_Date__c(legacy booking date), Deployment_Date__c,\n' +
         '  Expected_Close_Date__c, Actual_Closed_Date__c, Order_Stage_Date__c,\n' +
         '  Negotiation_Stage_Date__c, Proposal_Stage_Date__c, Prospect_Stage_Date__c,\n' +
         '  Approach_Stage_Date__c, POC_Stage_Date__c\n' +
@@ -1815,7 +1840,7 @@ public with sharing class AiSalesAssistantController {
         '  Query: SELECT Lead_Created_By__c, Lead_Created_By__r.Name, COUNT(Id) deals,\n' +
         '    SUM(Net_New_INR__c) revenue FROM Opportunity\n' +
         '    WHERE LeadSource = \'IS Generated\' AND StageName IN (\'Order\',\'POC\')\n' +
-        '    AND B_Deal_Date__c >= [date] GROUP BY Lead_Created_By__c, Lead_Created_By__r.Name\n' +
+        '    AND CloseDate >= [date] GROUP BY Lead_Created_By__c, Lead_Created_By__r.Name\n' +
         '    ORDER BY SUM(Net_New_INR__c) DESC\n' +
         '  For lead volume/conversion: COUNT(Id) FROM Lead WHERE Owner.UserRole.Name LIKE \'%SDR%\'\n' +
         '    AND IsConverted=true GROUP BY OwnerId, Owner.Name.\n' +
@@ -1899,7 +1924,8 @@ public with sharing class AiSalesAssistantController {
         '  GP value: GP__c. GP margin: GP__c / Revenue_Booked_Amount__c.\n' +
         '  Cost fields: Variable_Cost__c, Fixed_Cost__c, Total_Cost__c.\n' +
         '  Filter by: Parent_SKU__c, SKU__c, Cluster__c, Region__c, AOP_Category__c.\n' +
-        '  "Top customers by GP" → GROUP BY Customer_Universal_Account__r.Name, SKU__c (use Universal Account, NOT Account__r.Name).\n' +
+        '  "Top customers by GP" → GROUP BY Customer_Universal_Account__r.Name (use Universal Account, NOT Account__r.Name).\n' +
+        '  "GP by cluster" → GROUP BY Customer_Universal_Account__r.Cluster__c (use Universal Account Cluster, NOT Cluster__c directly).\n' +
         '  GPR (Gross Profit Retention): Same as NRR/GRR but using GP__c instead of Revenue.\n' +
         '  GP__c is in NATIVE currency — include Currency__c in SELECT for cross-region totals.\n\n' +
         'PENETRATION INDEX — from Tableau Penetration Index dashboard:\n' +
@@ -1991,7 +2017,7 @@ public with sharing class AiSalesAssistantController {
         '  "reversals"/"reversed deals" → Reversal_Type__c != null (any reversal)\n' +
         '  "full reversal" → Reversal_Type__c = \'Full Reversal\'\n' +
         '  "partial reversal" → Reversal_Type__c = \'Partial Reversal\'\n' +
-        '  For booking queries, EXCLUDE reversals by default: AND Net_New_INR__c >= 0\n\n' +
+        '  Do NOT exclude reversals by default — they are part of net booking totals.\n\n' +
         'DEAL CATEGORY (Deal_Category__c on Opportunity):\n' +
         '  "Hunting"/"hunter" → Deal_Category__c = \'Hunting\'\n' +
         '  "Farming"/"farmer" → Deal_Category__c = \'Farming\'\n\n' +
@@ -2070,7 +2096,7 @@ public with sharing class AiSalesAssistantController {
         '  admin-attributed deals (data artifacts), NOT real sales performance. Exclude them from rankings.\n' +
         '  Real sales roles: Sales_*, *AM (Account Manager), Inside Sales. CX/CSM are customer success.\n\n' +
         'WIN RATE ANALYSIS (Tableau-validated formula):\n' +
-        '  - Data arrives as two queries: Query 1 = Won (StageName=Order, B_Deal_Date__c), Query 2 = Consumed (terminal + Negotiation, CloseDate).\n' +
+        '  - Data arrives as two queries: Query 1 = Won (StageName=Order, CloseDate), Query 2 = Consumed (terminal + Negotiation, CloseDate).\n' +
         '  - Win Rate by Value = SUM(won Amount) / SUM(consumed Amount) per dimension.\n' +
         '  - Win Rate by Count = COUNT(won deals) / COUNT(consumed deals) per dimension.\n' +
         '  - ALWAYS present BOTH value and count win rates. A large gap means "winning small deals, losing large ones" (or vice versa).\n' +
@@ -2096,10 +2122,13 @@ public with sharing class AiSalesAssistantController {
         '    - A customer appearing only in H1 or only in H2 still counts — use their single-period value.\n' +
         '    - NEVER rank based on just one half. The final ranking MUST reflect the full year.\n' +
         '    - If one half is missing/truncated, EXPLICITLY warn that rankings are partial.\n' +
-        '  CURRENCY IN RANKINGS: When data includes Currency__c (INR/USD/AED):\n' +
+        '  CURRENCY IN RANKINGS: When data includes Currency__c column (INR/USD/AED):\n' +
         '    - Convert ALL values to INR before ranking (1 USD=83 INR, 1 AED=23 INR).\n' +
         '    - Show converted ₹ values in the ranking table.\n' +
-        '    - Note the conversion rate used.\n\n' +
+        '    - Note the conversion rate used.\n' +
+        '  ⚠️ CURRENCY CAUTION: If the SOQL result does NOT include a Currency__c column, assume ALL values are already in INR.\n' +
+        '    Do NOT attempt to convert or multiply — just sum and display as-is.\n' +
+        '    Only apply currency conversion when Currency__c is explicitly present in the result data.\n\n' +
         'CURRENCY DISPLAY: Format ALL monetary values in Indian Lakhs or Crores.\n' +
         '  1 Lakh = 100,000 (10^5). 1 Crore = 10,000,000 (10^7). Lakhs is NOT millions.\n' +
         '  To convert raw value to Lakhs: divide by 100,000 (NOT 1,000,000).\n' +

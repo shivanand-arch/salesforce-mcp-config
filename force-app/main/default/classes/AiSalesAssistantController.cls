@@ -51,16 +51,16 @@ public with sharing class AiSalesAssistantController {
         'Object: accounts_revenue__c\n' +
         'Primary date field: Revenue_Booked_On__c (Date type, format YYYY-MM-DD)\n' +
         'Allowed measures: Revenue_Booked_Amount__c, GP__c, Variable_Cost__c, Fixed_Cost__c, Total_Cost__c, Norm_Rev_Amount__c\n' +
-        'Allowed dimensions: Cluster__c, Region__c, SKU__c, Parent_SKU__c, Product_Type__c, Classification__c, Revenue_Classification__c, Currency__c, Customer_Universal_Account__r.Name, Account_Manager__c, CSM__c\n' +
-        'Parent_SKU__c values: Voice, Contact Centre, SMS, Whatsapp, Truecaller, Gen AI\n' +
-        'SKU__c values: PF Voice, PF Others, PF Messaging SMS, Enterprise CC, PF Messaging Whatsapp, PF Voice CC, PF Others TC, Conversational AI, Voice Streaming, Chatbot, CQA, Voicebot, PF Messaging Others, PF Messaging RCS, VSIP\n' +
-        'Cluster__c values: Africa, APAC, Banking and Insurance, BFSI & Strategic Large, Financial Services, FM Funded-I, FM Funded-II & Traditional-II, Internal, KSA, Marketplace, Mid Market, Mobility, Partnerships, Retail, Romena, Services, SMB, SME Funded, Technology, Traditional-I, UAE, US\n' +
-        'Region__c values: International, Scaleup, Domestic Enterprise\n' +
+        'Allowed dimensions: Customer_Universal_Account__r.Cluster__c, Customer_Universal_Account__r.Region__c, Parent_SKU__c, SKU__c, Product_Type__c, Classification__c, Revenue_Classification__c, Currency__c, Customer_Universal_Account__r.Name, Customer_Universal_Account__r.Owner.Name\n' +
+        'Parent_SKU__c values: Voice, Contact Centre, SMS, Whatsapp, Truecaller, Gen AI — DEFAULT for "by SKU"/"by product" questions.\n' +
+        'SKU__c values: PF Voice, PF Others, PF Messaging SMS, Enterprise CC, PF Messaging Whatsapp, PF Voice CC, PF Others TC, Conversational AI, Voice Streaming, Chatbot, CQA, Voicebot, PF Messaging Others, PF Messaging RCS, VSIP — only when user asks for detailed/sub-SKU.\n' +
+        'Customer_Universal_Account__r.Cluster__c values: Africa, APAC, Banking and Insurance, BFSI & Strategic Large, Financial Services, FM Funded-I, FM Funded-II & Traditional-II, Internal, KSA, Marketplace, Mid Market, Mobility, Partnerships, Retail, Romena, Services, SMB, SME Funded, Technology, Traditional-I, UAE, US\n' +
+        'Customer_Universal_Account__r.Region__c values: International, Scaleup, Domestic Enterprise\n' +
         'CRITICAL — Region vs Cluster disambiguation:\n' +
-        '  "Scaleup"/"Scaleups"/"Scale" → filter on Region__c = \'Scaleup\', NOT Cluster__c.\n' +
-        '  "Domestic"/"International" → filter on Region__c, NOT Cluster__c.\n' +
-        '  "BFSI"/"Retail"/"APAC"/"SME"/"Technology" etc. → filter on Cluster__c, NOT Region__c.\n' +
-        '  Region__c and Cluster__c have COMPLETELY DIFFERENT value sets. Never confuse them.\n' +
+        '  "Scaleup"/"Scaleups"/"Scale" → filter on Customer_Universal_Account__r.Region__c = \'Scaleup\'.\n' +
+        '  "Domestic"/"International" → filter on Customer_Universal_Account__r.Region__c.\n' +
+        '  "BFSI"/"Retail"/"APAC"/"SME"/"Technology" etc. → filter on Customer_Universal_Account__r.Cluster__c.\n' +
+        '  Region and Cluster have COMPLETELY DIFFERENT value sets. Never confuse them.\n' +
         'Revenue_Classification__c: Recurring, Non-Recurring\n' +
         'Classification__c: New Sales, Cross sell, Up sell, AMC Renewal\n' +
         'Currency__c values: INR, USD, AED\n' +
@@ -78,7 +78,7 @@ public with sharing class AiSalesAssistantController {
         'For revenue questions, return:\n' +
         '{"domain":"revenue","intent":"aggregate|detail|ranking","object":"accounts_revenue__c",' +
         '"measures":[{"fn":"SUM","field":"...","alias":"..."}],' +
-        '"dimensions":["Cluster__c"],' +
+        '"dimensions":["Customer_Universal_Account__r.Cluster__c"],' +
         '"filters":[{"field":"...","op":"=|!=|>|>=|<|<=|IN|NOT IN|BETWEEN","value":"..."}],' +
         '"dateFilter":{"field":"Revenue_Booked_On__c","start":"YYYY-MM-DD","end":"YYYY-MM-DD"},' +
         '"sort":{"field":"alias_or_dimension","direction":"ASC|DESC"},' +
@@ -86,8 +86,7 @@ public with sharing class AiSalesAssistantController {
         'Rules:\n' +
         '- ALWAYS include dateFilter with explicit start/end dates.\n' +
         '- For "top N" questions: set intent=ranking, limit=2000 (summary truncates), sort DESC on measure alias.\n' +
-        '- For customer rankings: use Customer_Universal_Account__r.Name dimension and add filter {"field":"Customer_Universal_Account__c","op":"!=","value":null}.\n' +
-        '- Include Currency__c dimension when data spans multiple currencies.\n' +
+        '- For customer rankings: use ONLY Customer_Universal_Account__r.Name as dimension. Do NOT add SKU, Cluster, Currency, or any other dimension — keep it simple like CRM Buddy. Add filter {"field":"Customer_Universal_Account__c","op":"!=","value":null}.\n' +
         '- Use BETWEEN op only in dateFilter; use IN op for picklist multi-value filters.\n' +
         '- detail intent is NOT allowed for accounts_revenue__c (too many rows). Use aggregate or ranking.\n' +
         '</instructions>\n\n' +
@@ -95,14 +94,14 @@ public with sharing class AiSalesAssistantController {
         'Q: "Total revenue this year"\n' +
         '{"domain":"revenue","intent":"aggregate","object":"accounts_revenue__c",' +
         '"measures":[{"fn":"SUM","field":"Revenue_Booked_Amount__c","alias":"rev"}],' +
-        '"dimensions":["Cluster__c","Currency__c"],' +
+        '"dimensions":["Parent_SKU__c"],' +
         '"filters":[],' +
-        '"dateFilter":{"field":"Revenue_Booked_On__c","start":"2025-04-01","end":"2026-03-14"},' +
+        '"dateFilter":{"field":"Revenue_Booked_On__c","start":"2025-04-01","end":"2026-03-31"},' +
         '"sort":{"field":"rev","direction":"DESC"},"limit":2000}\n\n' +
         'Q: "Top customers by GP in Q3"\n' +
         '{"domain":"revenue","intent":"ranking","object":"accounts_revenue__c",' +
         '"measures":[{"fn":"SUM","field":"GP__c","alias":"gp"}],' +
-        '"dimensions":["Customer_Universal_Account__r.Name","SKU__c","Cluster__c","Currency__c"],' +
+        '"dimensions":["Customer_Universal_Account__r.Name"],' +
         '"filters":[{"field":"Customer_Universal_Account__c","op":"!=","value":null}],' +
         '"dateFilter":{"field":"Revenue_Booked_On__c","start":"2025-10-01","end":"2025-12-31"},' +
         '"sort":{"field":"gp","direction":"DESC"},"limit":2000}\n\n' +
@@ -126,6 +125,81 @@ public with sharing class AiSalesAssistantController {
      */
     @TestVisible
     private static Boolean testPlannerFlag;
+
+    // ── Conversational follow-up classifier ──────────────────────────
+
+    private static final Set<String> DATA_KEYWORDS = new Set<String>{
+        'revenue', 'gp', 'gross profit', 'booking', 'pipeline', 'funnel',
+        'deals', 'tickets', 'leads', 'accounts', 'customers', 'cases',
+        'total', 'sum', 'count', 'average', 'how many', 'how much',
+        'top', 'bottom', 'highest', 'lowest', 'best', 'worst',
+        'compare', 'trend', 'growth', 'decline', 'churn',
+        'win rate', 'conversion', 'sales cycle', 'margin',
+        'cluster', 'region', 'sku', 'sector', 'segment',
+        'order', 'won', 'lost', 'open', 'closed',
+        'target', 'variance', 'achievement', 'forecast',
+        'mtd', 'qtd', 'ytd', 'this year', 'this quarter', 'this month',
+        'last year', 'last quarter', 'last month', 'fy', 'q1', 'q2', 'q3', 'q4'
+    };
+
+    /**
+     * Returns true if the message is a pure conversational follow-up
+     * with NO data intent. If ANY data keyword is found, returns false
+     * so the message goes through the normal SOQL path.
+     */
+    @TestVisible
+    private static Boolean isConversationalFollowup(String question) {
+        if (String.isBlank(question)) return false;
+        String lower = question.toLowerCase().trim();
+
+        // Short acknowledgements — always conversational
+        if (lower.length() <= 15) {
+            Set<String> acks = new Set<String>{
+                'yes', 'no', 'ok', 'okay', 'thanks', 'thank you', 'got it',
+                'cool', 'great', 'perfect', 'correct', 'right', 'sure', 'hmm'
+            };
+            if (acks.contains(lower) || acks.contains(lower.replaceAll('[.!?]', ''))) {
+                return true;
+            }
+        }
+
+        // If ANY data keyword is present → NOT a follow-up (safe default)
+        for (String kw : DATA_KEYWORDS) {
+            if (lower.contains(kw)) {
+                return false;
+            }
+        }
+
+        // No data keywords found → treat as conversational follow-up
+        return true;
+    }
+
+    /**
+     * Answers a conversational follow-up using conversation history.
+     * No SOQL generated — just Claude + context.
+     */
+    private static String handleConversationalFollowup(String question, String conversationContext) {
+        String systemPrompt =
+            'You are a helpful CRM data assistant called "Ask Salesforce".\n' +
+            'The user asked a conversational follow-up (not a data question).\n' +
+            'Answer based on the conversation history below. Be concise.\n' +
+            'Indian FY runs Apr-Mar. FY2026 = Apr 2025 - Mar 2026. Q1=Apr-Jun, Q2=Jul-Sep, Q3=Oct-Dec, Q4=Jan-Mar.\n' +
+            'Revenue data is from accounts_revenue__c. Bookings from Opportunity.\n' +
+            'Do NOT generate SOQL queries. Just answer conversationally.\n' +
+            'If you cannot answer from context, say: "I don\'t have enough context for that. Could you ask a data question?"';
+
+        String ctx = conversationContext.length() > 4000
+            ? '...' + conversationContext.substring(conversationContext.length() - 4000)
+            : conversationContext;
+
+        String userMessage = '[Conversation history]\n' + ctx +
+            '\n\n[Follow-up question]\n' + question;
+
+        ClaudeApiService.ClaudeResponse response =
+            ClaudeApiService.sendMessage(systemPrompt, userMessage, 2048);
+
+        return response.content;
+    }
 
     @TestVisible
     private static Boolean isStructuredPlannerEnabled() {
@@ -1410,22 +1484,32 @@ public with sharing class AiSalesAssistantController {
         '    For "accepted pipeline this FY": filter by ISQL_Accepted_Date__c in FY, use Pipeline stages (excl Suspect/Rejected/SDF Rejected).\n' +
         '    NOT for general pipeline queries.\n' +
         '\n' +
-        'SLANG / ABBREVIATION MAPPINGS (CRM Buddy Mapping Dictionary):\n' +
-        '  Region: "Dom"/"Domestic" → Domestic Enterprise, "Int" → International, "Scaleup" → Scaleup\n' +
-        '  Cluster: "BI" → Banking and Insurance, "FS" → Financial Services, "Tech" → Technology, "Marketplace" → Marketplace\n' +
-        '  Parent SKU: "AI" → Gen AI, "ECC" → Contact Centre / Contact Center, "Voice" → Voice, "PF Voice" → PF Voice\n' +
-        '  Revenue SKU: "ECC" → Enterprise CC (SKU__c level on accounts_revenue__c)\n' +
-        '  Deal Category: "Subs"/"Sub" → Subscription, "OT" → One Time\n' +
-        '  Voice Commit: "Commit"/"Commit Deal" → Voice Commit Deals, "Non Commit" → Voice Non-Commit Deals\n' +
-        '  Reversal: "Reversals"/"Reversal" → includes Partial Reversal and Reversal Reversal\n' +
+        'SLANG / ABBREVIATION MAPPINGS (CRM Buddy Mapping Dictionary — AUTHORITATIVE SOURCE):\n' +
+        '  === OPPORTUNITY DOMAIN ===\n' +
+        '  Region: "Dom"/"Domestic" → Domestic Enterprise, "Int" → International, "Scaleup" → Scaleup, "Internal" → Internal\n' +
+        '  Cluster: "BI" → Banking and Insurance, "FS" → Financial Services, "Tech" → Technology,\n' +
+        '    "Marketplace" → Marketplace, "Mobility" → Mobility, "Partnerships" → Partnerships,\n' +
+        '    "Retail" → Retail, "Services" → Services, "Africa" → Africa, "Romena" → Romena,\n' +
+        '    "APAC" → APAC, "UAE" → UAE, "US" → US, "KSA" → KSA, "SMB" → SMB, "Mid Market" → Mid Market, "Internal" → Internal\n' +
+        '  Parent SKU: "AI" → Gen AI, "ECC" → Contact Centre (or Contact Center)\n' +
+        '  Deal Category: "Subscription"/"Subs"/"Sub" → Subscription, "OT" → One Time\n' +
+        '  Voice Commit: "Commit Deal"/"Commit Deals"/"Commit" → Voice Commit Deals, "Non Commit" → Voice Non-Commit Deals\n' +
+        '  Reversal: "Reversals"/"Reversal" → includes both Partial Reversal AND Reversal Reversal\n' +
+        '  === REVENUE DOMAIN (accounts_revenue__c) ===\n' +
+        '  Region: "Domestic"/"Dom" → Domestic Enterprise, "Int" → International, "Scaleup" → Scaleup\n' +
+        '  Cluster: "BI" → Banking and Insurance, "FS" → Financial Services, "Marketplace" → Marketplace, "Tech" → Technology\n' +
+        '  Parent SKU: "Contact Centre"/"Contact Center" → Contact Centre / Contact Center, "Voice" → Voice, "AI"/"Gen AI" → Gen AI\n' +
+        '  SKU: "ECC" → Enterprise CC, "PF Voice" → PF Voice\n' +
         '  Revenue Classification: "Net New" → Revenue_Classification__c IN (Scaleup1, Scaleup2, Retention1, Retention2), "Organic" → Retention3\n' +
-        '  Churn: "Churn"/"Churned" → Is_Churned = TRUE (on revenue BigQuery — check Account.Account_Status__c = \'Churned\' in SOQL)\n' +
-        '  At Risk: "At Risk"/"Likely to churn" → Is_At_Risk = TRUE (check Account.RAG__c = \'RED\' in SOQL)\n' +
-        '  Margin: "GP Margin"/"Margin" = SUM(GP__c) / SUM(Revenue_Booked_Amount__c) — compute in summary, not SOQL\n' +
-        '  Time-period revenue slang: "MTD" = Month-to-Date, "QTD" = Quarter-to-Date, "LM" = Last Month,\n' +
-        '    "L3M"/"Last 3 Months" = prior 3 months, "L6M" = prior 6 months,\n' +
-        '    "R3M"/"Rolling 3 Months" = trailing 3 months incl current, "R6M"/"Rolling 6 Months" = trailing 6,\n' +
-        '    "R12M"/"Rolling 12 Months" = trailing 12 months. Translate these to Revenue_Booked_On__c date ranges.\n\n' +
+        '  Churn: "Churn"/"Churned" → Account.Account_Status__c = \'Churned\'\n' +
+        '  At Risk: "At Risk"/"Likely to churn" → Account.RAG__c = \'RED\'\n' +
+        '  Math rules (compute in summary, NOT in SOQL):\n' +
+        '    "GP Margin"/"Margin" = SUM(GP__c) / SUM(Revenue_Booked_Amount__c)\n' +
+        '    "MTD Margin" = SUM(MTD GP) / SUM(MTD Revenue), same pattern for LM/R3M/R6M/R12M\n' +
+        '  Time-period slang (translate to Revenue_Booked_On__c date ranges):\n' +
+        '    "MTD" = Month-to-Date, "QTD" = Quarter-to-Date, "LM" = Last Month,\n' +
+        '    "L3M" = prior 3 months, "L6M" = prior 6 months,\n' +
+        '    "R3M"/"Rolling 3 Months" = trailing 3 months incl current, "R6M" = trailing 6, "R12M" = trailing 12\n\n' +
         'AVERAGE DEAL SIZE: SUM(Normalize_Amount_INR__c)/COUNT(Id) for pipeline, SUM(Net_New_INR__c)/COUNT(Id) for bookings — compute in summary, not in SOQL.\n' +
         'SALES CYCLE: AVG of (CloseDate - CreatedDate) — SOQL cannot do date arithmetic. Fetch both dates, compute in summary.\n\n' +
         '=== MULTI-QUERY ANALYTICS ===\n' +
@@ -1461,15 +1545,16 @@ public with sharing class AiSalesAssistantController {
         'Example — YoY growth comparison:\n' +
         '-- Query 1: Current FY revenue\n' +
         '```soql\n' +
-        'SELECT Cluster__c, SUM(Revenue_Booked_Amount__c) currentRev\n' +
+        'SELECT Customer_Universal_Account__r.Cluster__c cluster, SUM(Revenue_Booked_Amount__c) currentRev\n' +
         'FROM accounts_revenue__c WHERE Revenue_Booked_On__c >= 2025-04-01 AND Revenue_Booked_On__c <= 2026-03-31\n' +
-        'GROUP BY Cluster__c LIMIT 2000\n' +
+        'GROUP BY Customer_Universal_Account__r.Cluster__c LIMIT 2000\n' +
         '```\n\n' +
         '-- Query 2: Previous FY revenue\n' +
         '```soql\n' +
-        'SELECT Cluster__c, SUM(Revenue_Booked_Amount__c) prevRev\n' +
+        'SELECT Customer_Universal_Account__r.Cluster__c cluster, SUM(Revenue_Booked_Amount__c) prevRev\n' +
         'FROM accounts_revenue__c WHERE Revenue_Booked_On__c >= 2024-04-01 AND Revenue_Booked_On__c <= 2025-03-31\n' +
-        'GROUP BY Cluster__c LIMIT 2000\n' +
+        'AND Customer_Universal_Account__c != null\n' +
+        'GROUP BY Customer_Universal_Account__r.Cluster__c LIMIT 2000\n' +
         '```\n\n' +
         '=== CURRENCY ===\n' +
         'Net_New_INR__c on Opportunity is ALREADY normalized to INR — BUT only populated for WON deals (Stage=Order).\n' +
@@ -1495,10 +1580,11 @@ public with sharing class AiSalesAssistantController {
         '    You can write a SINGLE full-year query — Apex handles the split automatically.\n' +
         '    Example for "revenue this year" (FY2026 = Apr 2025 - Mar 2026):\n' +
         '    ```soql\n' +
-        '    SELECT Cluster__c, SUM(Revenue_Booked_Amount__c) rev\n' +
+        '    SELECT Customer_Universal_Account__r.Cluster__c cluster, SUM(Revenue_Booked_Amount__c) rev\n' +
         '    FROM accounts_revenue__c\n' +
         '    WHERE Revenue_Booked_On__c >= 2025-04-01 AND Revenue_Booked_On__c <= 2026-03-31\n' +
-        '    GROUP BY Cluster__c\n' +
+        '    AND Customer_Universal_Account__c != null\n' +
+        '    GROUP BY Customer_Universal_Account__r.Cluster__c\n' +
         '    ```\n' +
         '    Apex auto-splits this into H1 (Apr-Sep) + H2 (Oct-Mar) and merges results.\n' +
         '    ALWAYS use GROUP BY with SUM/COUNT aggregates.\n' +
@@ -1513,25 +1599,41 @@ public with sharing class AiSalesAssistantController {
         '    ⚠️ CRITICAL: Account__c is the Setup/Tenant account (7,887 records). Customer_Universal_Account__c is the\n' +
         '    Universal Customer Account (6,231 records) that properly rolls up multiple setups/tenants into one customer.\n' +
         '    ALWAYS use Customer_Universal_Account__r.Name for customer-level aggregation.\n' +
-        '    GROUP BY Customer_Universal_Account__r.Name AND SKU__c — Tableau breaks rankings by Customer × SKU.\n' +
         '    Add "Customer_Universal_Account__c != null" in WHERE to exclude orphan records.\n' +
-        '    Also include Cluster__c, Currency__c in SELECT for context.\n' +
-        '    NOTE: You can generate a SINGLE full-year query — Apex auto-splits into H1/H2 chunks.\n' +
-        '    Example — "top 10 customers by GP":\n' +
+        '    ⚠️ KEEP IT SIMPLE: GROUP BY ONLY Customer_Universal_Account__r.Name. Do NOT add SKU, Cluster, Currency, or any other dimension.\n' +
+        '    Adding extra dimensions splits each customer into multiple rows and produces WRONG totals.\n' +
+        '    Only add extra dimensions if user explicitly asks (e.g., "top customers by SKU").\n' +
+        '    Example — "top 10 customers by revenue":\n' +
         '    ```soql\n' +
-        '    SELECT Customer_Universal_Account__r.Name acctName, SKU__c, Cluster__c, Currency__c, SUM(GP__c) gp\n' +
+        '    SELECT Customer_Universal_Account__r.Name acctName, SUM(Revenue_Booked_Amount__c) rev\n' +
         '    FROM accounts_revenue__c\n' +
         '    WHERE Revenue_Booked_On__c >= 2025-04-01 AND Revenue_Booked_On__c <= 2026-03-31\n' +
         '    AND Customer_Universal_Account__c != null\n' +
-        '    GROUP BY Customer_Universal_Account__r.Name, SKU__c, Cluster__c, Currency__c\n' +
-        '    ORDER BY SUM(GP__c) DESC LIMIT 2000\n' +
+        '    GROUP BY Customer_Universal_Account__r.Name\n' +
+        '    ORDER BY SUM(Revenue_Booked_Amount__c) DESC LIMIT 10\n' +
         '    ```\n' +
-        '    Apex auto-splits this into H1 (Apr-Sep) + H2 (Oct-Mar). Summary merges by Customer_Universal_Account__r.Name×SKU__c.\n' +
         '  Date Field: Revenue_Booked_On__c\n' +
-        '  Cluster/Sector: Cluster__c (directly on this object)\n' +
+        '  Cluster/Sector: Customer_Universal_Account__r.Cluster__c (from Universal Account — matches Tableau)\n' +
+        '    ⚠️ NEVER use Cluster__c or Region__c directly on accounts_revenue__c for grouping/filtering — they do not match Tableau.\n' +
+        '    ALWAYS use Customer_Universal_Account__r.Cluster__c and Customer_Universal_Account__r.Region__c.\n' +
+        '    ALWAYS add Customer_Universal_Account__c != null in WHERE when using Universal Account fields.\n' +
         '  Other fields: SKU__c, Products__c, Region__c, Classification__c,\n' +
         '    Revenue_Classification__c, Account__c(Setup/Tenant lookup), Customer_Universal_Account__c(Universal Customer lookup — USE THIS for customer rollups),\n' +
-        '    Customer_Name__c(string — often NULL, avoid), CSM__c(lookup), Account_Manager__c(lookup), Norm_Rev_Amount__c,\n' +
+        '    Customer_Name__c(string — often NULL, avoid), CSM__c(lookup — often System Admin, unreliable),\n' +
+        '    Account_Manager__c(lookup — ⚠️ JUNK DATA: populated with "System Admin" for nearly all records. NEVER use for AM queries),\n' +
+        '    Norm_Rev_Amount__c,\n' +
+        '  ACCOUNT MANAGER / ACCOUNT OWNER: For "account manager", "AM", "AD", "account director", "portfolio owner" queries:\n' +
+        '    Use Customer_Universal_Account__r.Owner.Name (the Account Owner on the Universal Account).\n' +
+        '    ⚠️ NEVER use Account_Manager__c on accounts_revenue__c — it contains "System Admin" and is useless.\n' +
+        '    Example — "top AMs by revenue":\n' +
+        '    ```soql\n' +
+        '    SELECT Customer_Universal_Account__r.Owner.Name am, SUM(Revenue_Booked_Amount__c) rev\n' +
+        '    FROM accounts_revenue__c\n' +
+        '    WHERE Revenue_Booked_On__c >= 2025-04-01 AND Revenue_Booked_On__c <= 2026-03-31\n' +
+        '    AND Customer_Universal_Account__c != null\n' +
+        '    GROUP BY Customer_Universal_Account__r.Owner.Name\n' +
+        '    ORDER BY SUM(Revenue_Booked_Amount__c) DESC LIMIT 10\n' +
+        '    ```\n' +
         '    Product_Type__c, AOP_Category__c, Revenue_Attribution__c,\n' +
         '    Variable_Cost__c, Fixed_Cost__c, Total_Cost__c, GP__c,\n' +
         '    Parent_SKU__c, Rev_Source__c, Rev_Sub_Source__c, Currency__c\n' +
@@ -1544,7 +1646,9 @@ public with sharing class AiSalesAssistantController {
         '  SKU__c VALUES (finer grain): PF Voice, PF Others, PF Messaging SMS, Enterprise CC,\n' +
         '    PF Messaging Whatsapp, PF Voice CC, PF Others TC, Conversational AI,\n' +
         '    Voice Streaming, Chatbot, CQA, Voicebot, PF Messaging Others, PF Messaging RCS, VSIP\n' +
-        '    Use SKU__c for detailed product breakdown, Parent_SKU__c for broad category.\n' +
+        '    DEFAULT: Always use Parent_SKU__c when user says "by SKU", "SKU view", "product breakdown", "by product".\n' +
+        '    Parent_SKU__c is the standard dashboard grouping (Voice, Contact Centre, SMS, Whatsapp, Truecaller, Gen AI).\n' +
+        '    Only use SKU__c if user explicitly says "detailed SKU", "sub-SKU", or names a specific SKU like "PF Voice" or "Enterprise CC".\n' +
         '  IMPORTANT: For product filtering, ALWAYS use = (exact match) on Parent_SKU__c.\n' +
         '    NEVER use LIKE with wildcards for SKU/Parent_SKU — values are exact picklist entries.\n' +
         '  Formula fields (NO GROUP BY): Account_Region__c, Universal_Acc_Cluster__c,\n' +
@@ -1554,29 +1658,25 @@ public with sharing class AiSalesAssistantController {
         '  Stage Filter: StageName IN (\'Order\',\'POC\')\n' +
         '  Date Field: B_Deal_Date__c (NOT CloseDate)\n' +
         '  Value Field: Net_New_INR__c (formula, already in INR)\n' +
-        '  DEDUP FIELD: Opportunity_Line_Item_Count__c — count of OpportunityLineItems per Opp.\n' +
-        '    17% of won deals have multiple line items, inflating raw SUM by ~22%.\n' +
-        '    ALWAYS include Opportunity_Line_Item_Count__c in SELECT for booking queries.\n' +
-        '    The summary step will divide each deal\'s value by its line item count before summing.\n' +
-        '  REVERSAL FILTER: Exclude Net_New_INR__c < 0 deals (reversals) from booking totals.\n' +
-        '    Add: AND Net_New_INR__c >= 0 to all booking aggregation queries.\n' +
-        '    37 reversal deals in FY25 = -1.1 Cr that Tableau excludes.\n' +
-        '  TABLEAU MATCHING: To match Tableau dashboard values:\n' +
-        '    1. Include Opportunity_Line_Item_Count__c in SELECT (cannot GROUP BY — it\'s a formula)\n' +
-        '    2. Add AND Net_New_INR__c >= 0 to exclude reversals\n' +
-        '    3. Summary step: for each deal, use Net_New_INR__c / Opportunity_Line_Item_Count__c\n' +
-        '    4. Remaining ~5% gap is due to currency rate differences (Tableau uses USD=85, SF formula varies)\n\n' +
+        '  ⚠️ DO NOT exclude negative values: NEVER add "AND Net_New_INR__c >= 0". Negative values (reversals) are part of the booking total.\n' +
+        '  ⚠️ DO NOT include Opportunity_Line_Item_Count__c. No dedup needed — SUM(Net_New_INR__c) gives the correct total directly.\n' +
+        '  KEEP IT SIMPLE: Just SUM(Net_New_INR__c) with the stage and date filters. No extra filters, no dedup.\n\n' +
         'DEFAULT: Use accounts_revenue__c for revenue questions unless user\n' +
         '  specifically asks about deals/bookings/pipeline/opportunities.\n' +
-        'SECTOR queries: Use Cluster__c on accounts_revenue__c, or Account_Cluster__c on Opportunity.\n' +
+        'SECTOR queries: Use Customer_Universal_Account__r.Cluster__c on accounts_revenue__c, or Account_Cluster__c on Opportunity.\n' +
         '⚠️ REGION vs CLUSTER DISAMBIGUATION (critical — gets confused often):\n' +
-        '  Region__c has ONLY 3 values: International, Scaleup, Domestic Enterprise.\n' +
-        '  Cluster__c has 22 values: BFSI, SME Funded, Technology, Retail, APAC, UAE, etc.\n' +
-        '  "Scaleup"/"Scaleups"/"Scale" → ALWAYS filter Region__c = \'Scaleup\', NEVER Cluster__c.\n' +
-        '  "Domestic"/"Dom" → ALWAYS filter Region__c = \'Domestic Enterprise\', NEVER Cluster__c.\n' +
-        '  "International"/"Intl" → ALWAYS filter Region__c = \'International\', NEVER Cluster__c.\n' +
-        '  "BFSI"/"Retail"/"APAC"/"SME"/"Technology"/etc. → filter Cluster__c, NEVER Region__c.\n' +
-        '  RULE: If the user\'s term matches a Region__c value, use Region__c. If it matches a Cluster__c value, use Cluster__c. Never swap them.\n\n' +
+        '  On accounts_revenue__c: use Customer_Universal_Account__r.Region__c (3 values) and Customer_Universal_Account__r.Cluster__c (22 values).\n' +
+        '  On Opportunity: use Account_Region__c and Account_Cluster__c.\n' +
+        '  "Scaleup"/"Scaleups"/"Scale" → Region = \'Scaleup\'.\n' +
+        '  "Domestic"/"Dom" → Region = \'Domestic Enterprise\'.\n' +
+        '  "International"/"Intl" → Region = \'International\'.\n' +
+        '  "BFSI"/"Retail"/"APAC"/"SME"/"Technology"/etc. → Cluster.\n' +
+        '  RULE: On accounts_revenue__c, use Customer_Universal_Account__r.Region__c / Customer_Universal_Account__r.Cluster__c.\n' +
+        '  On Opportunity, use Account_Region__c / Account_Cluster__c. Never use bare Cluster__c or Region__c on revenue.\n' +
+        '  REGION CONSOLIDATION (Opportunity): Account_Region__c has 4 standard values: Domestic Enterprise, International, Scaleup, Internal.\n' +
+        '    "Americas" → treat as International. In summary, merge Americas deals into International.\n' +
+        '    NULL/blank region → attribute to the closest region based on Account_Cluster__c, or show as "Untagged" only if significant.\n' +
+        '    Tableau only shows 4 regions — our output should match.\n\n' +
         '=== OPPORTUNITY (341 fields) ===\n' +
         'Standard: Id, Name, AccountId, OwnerId, StageName, Amount, CloseDate, CreatedDate,\n' +
         '  LastModifiedDate, IsClosed, IsWon, Probability, Type, LeadSource, Description,\n' +
@@ -1584,7 +1684,7 @@ public with sharing class AiSalesAssistantController {
         '  CampaignId, CurrencyIsoCode, HasOpportunityLineItem, RecordTypeId\n\n' +
         'Custom Number: MRR_Amount__c(MRR,NUMBER not Currency,88% filled), One_Time_Value__c(100% filled),\n' +
         '  Net_New__c, Full_Potential_Value__c(39% filled — use with caution),\n' +
-        '  Opportunity_Line_Item_Count__c(rollup count of line items — INCLUDE in booking queries for dedup)\n' +
+        '  Opportunity_Line_Item_Count__c(rollup count — DO NOT use for dedup, not needed)\n' +
         'UNRELIABLE Opp fields (<5% fill — NEVER use for ranking/aggregation):\n' +
         '  Committed_Booking_Value__c(5%), Channels_Count__c(3%), DID_Count__c(3%),\n' +
         '  Number_of_seats__c(0%), Seats_Count__c(does not exist on Opp)\n' +
@@ -1610,7 +1710,7 @@ public with sharing class AiSalesAssistantController {
         'Lookup: Product_Specialist__c(User/Pre-Sales), Co_owner__c(User/CSM), Lead__c(Lead),\n' +
         '  Lead_Created_By__c(User), Owner_Manager__c(User)\n' +
         'Formula(read-only,NO GROUP BY): Net_New_INR__c(Net New INR - ONLY for WON deals/bookings, ZERO for pipeline/lost),\n' +
-        '  Opportunity_Line_Item_Count__c(line item count — use for dedup in summary, NOT in GROUP BY),\n' +
+        '  Opportunity_Line_Item_Count__c(line item count — NOT needed for booking queries),\n' +
         '  Amount_INR__c, Amount_USD__c, Norm_MRR__c, Total_Amount__c,\n' +
         '  Sales_Cycle__c, Business_Unit__c, Cluster__c, Region__c, Stage_Name__c,\n' +
         '  Source_Type__c, Age__c, Last_Activity_Since__c\n\n' +
@@ -1882,23 +1982,23 @@ public with sharing class AiSalesAssistantController {
         'RETENTION (NRR/GRR) — from Tableau Retention Dashboard (accounts_revenue__c):\n' +
         '  MULTI-QUERY REQUIRED. Compare two periods:\n' +
         '  -- Query 1: Current period revenue by Account/Cluster/SKU\n' +
-        '  SELECT Cluster__c, Account__c, SUM(Revenue_Booked_Amount__c) rev FROM accounts_revenue__c\n' +
-        '    WHERE Revenue_Booked_On__c >= [current_start] AND Revenue_Booked_On__c <= [current_end]\n' +
-        '    GROUP BY Cluster__c, Account__c ORDER BY SUM(Revenue_Booked_Amount__c) DESC LIMIT 2000\n' +
+        '  SELECT Customer_Universal_Account__r.Cluster__c cluster, Customer_Universal_Account__r.Name acct, SUM(Revenue_Booked_Amount__c) rev FROM accounts_revenue__c\n' +
+        '    WHERE Revenue_Booked_On__c >= [current_start] AND Revenue_Booked_On__c <= [current_end] AND Customer_Universal_Account__c != null\n' +
+        '    GROUP BY Customer_Universal_Account__r.Cluster__c, Customer_Universal_Account__r.Name ORDER BY SUM(Revenue_Booked_Amount__c) DESC LIMIT 2000\n' +
         '  -- Query 2: Preceding period revenue by same dimensions\n' +
-        '  SELECT Cluster__c, Account__c, SUM(Revenue_Booked_Amount__c) rev FROM accounts_revenue__c\n' +
-        '    WHERE Revenue_Booked_On__c >= [preceding_start] AND Revenue_Booked_On__c <= [preceding_end]\n' +
-        '    GROUP BY Cluster__c, Account__c ORDER BY SUM(Revenue_Booked_Amount__c) DESC LIMIT 2000\n' +
+        '  SELECT Customer_Universal_Account__r.Cluster__c cluster, Customer_Universal_Account__r.Name acct, SUM(Revenue_Booked_Amount__c) rev FROM accounts_revenue__c\n' +
+        '    WHERE Revenue_Booked_On__c >= [preceding_start] AND Revenue_Booked_On__c <= [preceding_end] AND Customer_Universal_Account__c != null\n' +
+        '    GROUP BY Customer_Universal_Account__r.Cluster__c, Customer_Universal_Account__r.Name ORDER BY SUM(Revenue_Booked_Amount__c) DESC LIMIT 2000\n' +
         '  NRR = SUM(current) / SUM(preceding) x 100 (includes expansion/upsell).\n' +
         '  GRR = same but excludes expansion (filter Revenue_Classification__c).\n' +
         '  Variants: Monthly, Rolling 3M, Rolling 12M, YTD.\n' +
         '  Also NRGP/GRGP = same formulas using GP__c instead of Revenue_Booked_Amount__c.\n' +
-        '  Keyholes: Region__c, Cluster__c, Parent_SKU__c, SKU__c, AD/CSM.\n\n' +
+        '  Keyholes: Customer_Universal_Account__r.Region__c, Customer_Universal_Account__r.Cluster__c, Parent_SKU__c, SKU__c, AD/CSM.\n\n' +
         'GP / GROSS PROFIT — from Tableau Revenue Dashboard (accounts_revenue__c):\n' +
         '  ⚠️ SAME GOVERNOR LIMIT AS REVENUE. GP queries on accounts_revenue__c MUST split H1/H2.\n' +
         '  GP value: GP__c. GP margin: GP__c / Revenue_Booked_Amount__c.\n' +
         '  Cost fields: Variable_Cost__c, Fixed_Cost__c, Total_Cost__c.\n' +
-        '  Filter by: Parent_SKU__c, SKU__c, Cluster__c, Region__c, AOP_Category__c.\n' +
+        '  Filter by: Parent_SKU__c, SKU__c, Customer_Universal_Account__r.Cluster__c, Customer_Universal_Account__r.Region__c, AOP_Category__c.\n' +
         '  "Top customers by GP" → GROUP BY Customer_Universal_Account__r.Name, SKU__c (use Universal Account, NOT Account__r.Name).\n' +
         '  GPR (Gross Profit Retention): Same as NRR/GRR but using GP__c instead of Revenue.\n' +
         '  GP__c is in NATIVE currency — include Currency__c in SELECT for cross-region totals.\n\n' +
@@ -1910,7 +2010,7 @@ public with sharing class AiSalesAssistantController {
         '  GPI = Growth Penetration Index (mature high-revenue accounts).\n' +
         '  Query: SUM(Revenue_Booked_Amount__c) FROM accounts_revenue__c GROUP BY Account__c,\n' +
         '    then count accounts meeting each threshold.\n' +
-        '  Keyholes: Region__c, Cluster__c, Parent_SKU__c, AD Name, CSM Name.\n\n' +
+        '  Keyholes: Customer_Universal_Account__r.Region__c, Customer_Universal_Account__r.Cluster__c, Parent_SKU__c, AD Name, CSM Name.\n\n' +
         'TARGET & VARIANCE — from Tableau Variance Analysis dashboard:\n' +
         '  For "target vs actual", "variance", "achievement %" questions:\n' +
         '  MULTI-QUERY REQUIRED:\n' +
@@ -1947,12 +2047,12 @@ public with sharing class AiSalesAssistantController {
         '  "suspects" → StageName = \'Suspect\' (pre-qualification, NOT part of pipeline)\n' +
         '  "SDF"/"SDF stage" → StageName = \'SDF Submission\'\n' +
         '  "POC closed" → StageName = \'POC Closed\' (treated as a loss stage)\n\n' +
-        'REGION ABBREVIATIONS (Account_Region__c on Opportunity, Region__c on accounts_revenue__c):\n' +
+        'REGION ABBREVIATIONS (Account_Region__c on Opportunity, Customer_Universal_Account__r.Region__c on accounts_revenue__c):\n' +
         '  "Dom"/"Domestic" → \'Domestic Enterprise\'\n' +
         '  "Int"/"Intl"/"International" → \'International\'\n' +
         '  "Scale"/"Scaleup" → \'Scaleup\'\n' +
         '  "Americas"/"US" → \'Americas\'\n\n' +
-        'CLUSTER ABBREVIATIONS (Account_Cluster__c on Opportunity, Cluster__c on accounts_revenue__c):\n' +
+        'CLUSTER ABBREVIATIONS (Account_Cluster__c on Opportunity, Customer_Universal_Account__r.Cluster__c on accounts_revenue__c):\n' +
         '  "BI"/"BFSI" → \'Banking and Insurance\'\n' +
         '  "FS" → \'Financial Services\'\n' +
         '  "Tech" → \'Technology\'\n' +
@@ -1991,7 +2091,7 @@ public with sharing class AiSalesAssistantController {
         '  "reversals"/"reversed deals" → Reversal_Type__c != null (any reversal)\n' +
         '  "full reversal" → Reversal_Type__c = \'Full Reversal\'\n' +
         '  "partial reversal" → Reversal_Type__c = \'Partial Reversal\'\n' +
-        '  For booking queries, EXCLUDE reversals by default: AND Net_New_INR__c >= 0\n\n' +
+        '  ⚠️ DO NOT exclude reversals from booking queries. NEVER add Net_New_INR__c >= 0. Include ALL values.\n\n' +
         'DEAL CATEGORY (Deal_Category__c on Opportunity):\n' +
         '  "Hunting"/"hunter" → Deal_Category__c = \'Hunting\'\n' +
         '  "Farming"/"farmer" → Deal_Category__c = \'Farming\'\n\n' +
@@ -2027,16 +2127,27 @@ public with sharing class AiSalesAssistantController {
         '  Example: "my pipeline" → add OwnerId filter to pipeline query.\n' +
         'Otherwise, return ORG-WIDE data by default. Do NOT apply ownership filters for general questions.\n\n' +
         '=== GRANULARITY MANDATE ===\n' +
-        'NEVER write SOQL that returns ONLY a single aggregate number (e.g., just SELECT SUM(Amount) FROM Opportunity).\n' +
-        'Even for simple total questions ("total pipeline", "total revenue"), ALWAYS include dimensional breakdowns:\n' +
-        '  - Include at least ONE dimension: Account_Cluster__c, Owner.Name, StageName, Region__c, or SKU__c.\n' +
-        '  - GROUP BY the dimension and ORDER BY the aggregate DESC.\n' +
+        'For simple total questions ("total pipeline", "total revenue"), include ONE dimensional breakdown:\n' +
+        '  - Opportunity queries: GROUP BY Account_Cluster__c (or StageName, Owner.Name, Account_Region__c).\n' +
+        '  - Revenue queries (accounts_revenue__c):\n' +
+        '    "by SKU" / "by product" → GROUP BY Parent_SKU__c\n' +
+        '    "by cluster" / "by segment" → GROUP BY Customer_Universal_Account__r.Cluster__c\n' +
+        '      Add: Customer_Universal_Account__c != null in WHERE.\n' +
+        '      ⚠️ NEVER use Cluster__c directly on accounts_revenue__c — it does not match Tableau.\n' +
+        '      ALWAYS use Customer_Universal_Account__r.Cluster__c for cluster grouping.\n' +
+        '    "by region" → GROUP BY Customer_Universal_Account__r.Region__c (add Customer_Universal_Account__c != null)\n' +
+        '    Default (no dimension specified): GROUP BY Parent_SKU__c\n' +
+        '    NEVER cross-group Cluster × SKU in a single query (governor limit risk). Use one dimension at a time.\n' +
         '  - This gives the summary step data for top/bottom contributor analysis.\n' +
-        'Example: "What is total pipeline?" →\n' +
-        '  SELECT Account_Cluster__c, StageName, COUNT(Id) cnt, SUM(Amount) val\n' +
-        '  FROM Opportunity WHERE StageName IN (\'Approach\',\'Prospect\',\'Proposal\',\'Negotiation\',\'SDF Submission\',\'POC\',\'On Hold\')\n' +
-        '  GROUP BY Account_Cluster__c, StageName ORDER BY SUM(Amount) DESC LIMIT 2000\n' +
-        'The only exception: COUNT() queries for a single precise number ("how many open cases?") may return one row.';
+        'The only exception: COUNT() queries for a single precise number ("how many open cases?") may return one row.\n\n' +
+        '⚠️ ABSOLUTE RULE — ALL DATA MUST COME FROM SOQL:\n' +
+        'Every single number, percentage, count, total, and breakdown shown to the user MUST originate from SOQL query results.\n' +
+        'Claude\'s ONLY role is to ANALYZE and provide INSIGHTS on SOQL data — never to generate, compute, estimate, or infer any data point.\n' +
+        'FORBIDDEN: Creating numbers not in SOQL results, computing breakdowns from memory, estimating values, inferring trends from assumed knowledge.\n' +
+        'ALLOWED: Summing SOQL rows, computing ratios FROM SOQL data (e.g., GP margin = GP/Revenue where both are from SOQL), ranking SOQL rows, comparing SOQL periods.\n' +
+        'If the SOQL grouped by Parent_SKU__c, show ONLY a SKU breakdown. Do NOT add a cluster breakdown.\n' +
+        'If the SOQL grouped by Cluster, show ONLY a cluster breakdown. Do NOT add a SKU breakdown.\n' +
+        'If the user wants a different breakdown, suggest a follow-up question — NEVER fabricate it.';
 
     private static final String SUMMARY_SYSTEM_PROMPT =
         'You are a senior business analyst at Exotel. Think like a VP of Sales reviewing data — don\'t just restate numbers, ANALYZE them.\n\n' +
@@ -2050,18 +2161,21 @@ public with sharing class AiSalesAssistantController {
         '- If the dataset seems unusually small, call it out (e.g. "Only 2 deals matched — this may indicate a data tagging gap").\n' +
         '- ACCURACY FIRST: The SOQL may fetch a wider date range than asked. Always clearly separate data that falls within the user\'s exact timeframe vs edge-case records (e.g. "Within the last 6 months: X deals. Additionally, 1 deal with a future close date of Mar 15 is already marked lost.").\n' +
         '- Never inflate counts or totals — be transparent about what you include and why.\n\n' +
+        '⚠️ ABSOLUTE RULE — SOQL IS THE ONLY SOURCE OF TRUTH:\n' +
+        'Every number you present MUST come from the SOQL query results provided to you. No exceptions.\n' +
+        'Your role is ANALYSIS and INSIGHTS only — you do NOT generate data.\n' +
+        '- If the data has a cluster breakdown, present it. If it does NOT, do NOT create one.\n' +
+        '- If the data has a SKU breakdown, present it. If it does NOT, do NOT create one.\n' +
+        '- NEVER show a table, chart, or number that is not directly derived from the SOQL rows.\n' +
+        '- Ratios (GP margin, win rate, share %) are OK — they are computed FROM SOQL data.\n' +
+        '- If the user would benefit from another breakdown, suggest: "Would you like me to run a query by [cluster/SKU/region]?"\n\n' +
         'CURRENCY RULES: When data uses Net_New_INR__c, ALL values are already in INR — show unified ' +
         'rankings in ₹ across ALL regions (Domestic + International). Do NOT split by currency. ' +
         'When data uses Amount or Net_New__c with CurrencyIsoCode, show Indian deals in ₹ and ' +
         'International deals in $ but ALWAYS include an INR-equivalent total for unified comparison ' +
         '(1 USD=83 INR, 1 AED=23 INR). Never omit international reps from leaderboards.\n\n' +
-        'BOOKING DEDUP: When data includes Opportunity_Line_Item_Count__c:\n' +
-        '  For each deal, compute ADJUSTED value = Net_New_INR__c / Opportunity_Line_Item_Count__c.\n' +
-        '  Use ADJUSTED values for all booking totals and rankings.\n' +
-        '  This matches how the Tableau dashboard deduplicates multi-product deals.\n' +
-        '  If Opportunity_Line_Item_Count__c is null or 0, treat as 1 (no dedup needed).\n' +
-        '  Show both "Raw Total" and "Adjusted Total (deduped)" when presenting booking summaries.\n' +
-        '  The adjusted total will be ~20% lower than raw — this is correct and matches the dashboard.\n\n' +
+        'BOOKING VALUES: SUM(Net_New_INR__c) is the correct booking total. No dedup needed. No reversal exclusion.\n' +
+        '  Do NOT divide by Opportunity_Line_Item_Count__c. Do NOT show "adjusted" or "deduped" totals.\n\n' +
         'QUARTER DEFINITIONS: Q1=Apr-Jun, Q2=Jul-Sep, Q3=Oct-Dec, Q4=Jan-Mar. FY runs April to March.\n\n' +
         'SDR PERFORMANCE: Rank SDRs by downstream won Opportunity revenue (via Lead_Created_By__c),\n' +
         '  NOT by MRR_Amount__c on Lead (which has <10% fill rate). Show: deals won, total revenue,\n' +
@@ -2091,7 +2205,7 @@ public with sharing class AiSalesAssistantController {
         '  - If a dimension appears in one query but not the other, flag it (e.g., "No won deals in this cluster").\n' +
         '  - For cross-object queries (e.g., Opportunity + accounts_revenue__c), explain how the datasets relate.\n' +
         '  H1/H2 MERGE FOR RANKINGS: When queries are split by time period (H1=Apr-Sep, H2=Oct-Mar):\n' +
-        '    - MUST merge H1+H2 data by matching dimension keys (Customer_Universal_Account__r.Name×SKU__c, or Cluster__c, etc.).\n' +
+        '    - MUST merge H1+H2 data by matching dimension keys (Customer_Universal_Account__r.Name×SKU__c, or Customer_Universal_Account__r.Cluster__c, etc.).\n' +
         '    - Sum values across periods BEFORE ranking. A customer in both H1 and H2 gets their totals added.\n' +
         '    - A customer appearing only in H1 or only in H2 still counts — use their single-period value.\n' +
         '    - NEVER rank based on just one half. The final ranking MUST reflect the full year.\n' +
@@ -2100,13 +2214,18 @@ public with sharing class AiSalesAssistantController {
         '    - Convert ALL values to INR before ranking (1 USD=83 INR, 1 AED=23 INR).\n' +
         '    - Show converted ₹ values in the ranking table.\n' +
         '    - Note the conversion rate used.\n\n' +
-        'CURRENCY DISPLAY: Format ALL monetary values in Indian Lakhs or Crores.\n' +
-        '  1 Lakh = 100,000 (10^5). 1 Crore = 10,000,000 (10^7). Lakhs is NOT millions.\n' +
-        '  To convert raw value to Lakhs: divide by 100,000 (NOT 1,000,000).\n' +
-        '  Examples: 2142000 → ₹21.42 L.  24265419 → ₹242.65 L.  50000000 → ₹500.00 L.  150000000 → ₹15.00 Cr.\n' +
-        '  For values ≥ ₹100 L (i.e. ≥ 1 Cr raw), use Crores. Otherwise use Lakhs.\n' +
-        '  IMPORTANT: PRE-COMPUTED TOTALS already include Lakhs/Crores formatting in parentheses — use those formatted values directly.\n' +
-        '  Be consistent within one response — pick Lakhs or Crores based on the magnitude of the largest value.\n\n' +
+        'CURRENCY DISPLAY:\n' +
+        '  ⚠️ ALWAYS use the _display fields (e.g., rev_display, gp_display, totalRevenue_display) for formatted values.\n' +
+        '  These are pre-computed by Apex and are ALWAYS correct. NEVER do your own Lakhs/Crores math.\n' +
+        '  If _display fields are present, use them EXACTLY as-is. Do NOT recompute or reformat.\n' +
+        '  If _display fields are NOT present, then format manually:\n' +
+        '    1 Lakh (L) = 1,00,000 = 100,000 (10^5). Lakhs is NOT millions.\n' +
+        '    1 Crore (Cr) = 1,00,00,000 = 10,000,000 (10^7).\n' +
+        '    To convert raw → Lakhs: divide by 100,000 (NOT 1,000,000).\n' +
+        '    To convert raw → Crores: divide by 10,000,000.\n' +
+        '    Examples: 73842316 → ₹738.42 L OR ₹7.38 Cr.  415790741 → ₹4,157.91 L OR ₹41.58 Cr.\n' +
+        '    Use Lakhs (L) as the default unit — it matches Tableau dashboards. Use Crores only for very large totals.\n' +
+        '  Be consistent within one response — pick ONE unit for all values.\n\n' +
         'PIPELINE AGING: When analyzing pipeline/open deals, classify deal health by age:\n' +
         '  🔴 Critical: >120 days open (stale, needs intervention)\n' +
         '  🟡 Warning: 60-120 days open (at risk of going stale)\n' +
@@ -2223,6 +2342,17 @@ public with sharing class AiSalesAssistantController {
             } catch (Exception kpiEx) {
                 // KPI engine error — log and fall through to existing flow
                 System.debug(LoggingLevel.WARN, 'KPI_ENGINE_ERROR: ' + kpiEx.getMessage() + ' — falling through');
+            }
+
+            // ── Conversational follow-up classifier ──
+            // Detects pure conversational messages (no data intent) and answers
+            // using conversation history without generating SOQL.
+            if (String.isNotBlank(conversationContext) && isConversationalFollowup(userQuestion)) {
+                resp.answer = handleConversationalFollowup(userQuestion, conversationContext);
+                resp.success = true;
+                logQuery(userQuestion, null, null,
+                         0, true, null, 'FOLLOWUP', 0, resp.executionTimeMs);
+                return resp;
             }
 
             // Prepend full conversation history so Claude can resolve follow-ups
@@ -3053,6 +3183,24 @@ public with sharing class AiSalesAssistantController {
      */
     private static QueryResult executeWithRetry(String soql, String context) {
         QueryResult qr = new QueryResult();
+        // Strip rogue lookback date filters Claude sometimes adds to revenue queries
+        // (e.g., "AND Revenue_Booked_On__c >= 2024-03-24" — a 2-year lookback that is never needed)
+        if (soql.containsIgnoreCase('accounts_revenue__c')) {
+            // Find the primary date range (first >= and <= pair)
+            Pattern primaryRange = Pattern.compile(
+                '(?i)Revenue_Booked_On__c\\s*>=\\s*(\\d{4}-\\d{2}-\\d{2})\\s+AND\\s+Revenue_Booked_On__c\\s*<=\\s*(\\d{4}-\\d{2}-\\d{2})'
+            );
+            Matcher pm = primaryRange.matcher(soql);
+            if (pm.find()) {
+                // Remove any ADDITIONAL Revenue_Booked_On__c filters after the primary range
+                String before = soql.substring(0, pm.end());
+                String after = soql.substring(pm.end());
+                after = after.replaceAll(
+                    '(?i)\\s+AND\\s+Revenue_Booked_On__c\\s*(>=|<=|>|<|=)\\s*\\d{4}-\\d{2}-\\d{2}', ''
+                );
+                soql = before + after;
+            }
+        }
         qr.finalSoql = soql;
         System.QueryException lastQueryError = null;
 

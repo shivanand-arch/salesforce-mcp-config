@@ -1302,6 +1302,113 @@ public with sharing class AiSalesAssistantController {
             result.resultsJson = buildCycleResultsJson(
                 kpiId, displayName, formulaType, timeLabel, dimension, note,
                 rows, overallValue, allDays.size());
+
+        } else if (formulaType == 'PERIOD_RATIO') {
+            // NRR/GRR: Compare revenue across two consecutive periods (e.g., current vs previous quarter)
+            String measureField = (String) kpiDef.get('measureField');
+            String measureFn = (String) kpiDef.get('measureFn');
+            String baseObject = (String) kpiDef.get('baseObject');
+            String dateField = (String) kpiDef.get('dateField');
+
+            // Optional extra filters (e.g., GRR requires Revenue_Classification filter)
+            String extraFilters = kpiDef.containsKey('extraFilters') ?
+                ' ' + (String) kpiDef.get('extraFilters') : '';
+            Boolean capNumerator = kpiDef.containsKey('capNumerator') &&
+                (Boolean) kpiDef.get('capNumerator');
+
+            // Compute preceding period (same duration, shifted back)
+            Long daysBetween = startDate.daysBetween(endDate);
+            Date prevStart = startDate.addDays(-(Integer)(daysBetween + 1));
+            Date prevEnd = startDate.addDays(-1);
+
+            // Build tight aggregate queries — just dimension + SUM, no joins
+            String currSoql = 'SELECT ' + dimension + ', SUM(' + measureField + ') val' +
+                ' FROM ' + baseObject +
+                ' WHERE ' + dateField + ' >= ' + String.valueOf(startDate) +
+                ' AND ' + dateField + ' <= ' + String.valueOf(endDate) +
+                extraFilters +
+                ' GROUP BY ' + dimension +
+                ' ORDER BY SUM(' + measureField + ') DESC LIMIT 2000';
+            String prevSoql = 'SELECT ' + dimension + ', SUM(' + measureField + ') val' +
+                ' FROM ' + baseObject +
+                ' WHERE ' + dateField + ' >= ' + String.valueOf(prevStart) +
+                ' AND ' + dateField + ' <= ' + String.valueOf(prevEnd) +
+                extraFilters +
+                ' GROUP BY ' + dimension +
+                ' ORDER BY SUM(' + measureField + ') DESC LIMIT 2000';
+
+            result.soqlQueries.add(currSoql);
+            result.soqlQueries.add(prevSoql);
+
+            System.debug('KPI_ENGINE: current period SOQL = ' + currSoql);
+            System.debug('KPI_ENGINE: previous period SOQL = ' + prevSoql);
+
+            // accounts_revenue__c exceeds 50K rows even for one quarter — aggregate
+            // queries still count underlying rows toward the governor limit.
+            // Call executeViaRestApi directly (skipping executeWithRetry's COUNT
+            // estimation and retry overhead to save CPU time).
+            QueryResult currQr = executeViaRestApi(currSoql);
+            QueryResult prevQr = executeViaRestApi(prevSoql);
+
+            // REST API returns JSON — parse into dimension → value maps
+            List<Object> currList = (List<Object>) JSON.deserializeUntyped(currQr.restApiJson);
+            List<Object> prevList = (List<Object>) JSON.deserializeUntyped(prevQr.restApiJson);
+            result.totalRecords = currList.size() + prevList.size();
+
+            Map<String, Decimal> currMap = new Map<String, Decimal>();
+            for (Object o : currList) {
+                Map<String, Object> rec = (Map<String, Object>) o;
+                String dimVal = String.valueOf(rec.get(dimension));
+                currMap.put(dimVal, rec.get('val') != null ? Decimal.valueOf(String.valueOf(rec.get('val'))) : 0);
+            }
+            Map<String, Decimal> prevMap = new Map<String, Decimal>();
+            for (Object o : prevList) {
+                Map<String, Object> rec = (Map<String, Object>) o;
+                String dimVal = String.valueOf(rec.get(dimension));
+                prevMap.put(dimVal, rec.get('val') != null ? Decimal.valueOf(String.valueOf(rec.get('val'))) : 0);
+            }
+
+            // Compute NRR per dimension
+            List<KpiRow> rows = new List<KpiRow>();
+            Decimal grandCurr = 0, grandPrev = 0;
+            Set<String> allDims = new Set<String>();
+            allDims.addAll(currMap.keySet());
+            allDims.addAll(prevMap.keySet());
+
+            for (String dimVal : allDims) {
+                KpiRow row = new KpiRow();
+                row.groupValue = dimVal;
+                Decimal currVal = currMap.containsKey(dimVal) ? currMap.get(dimVal) : 0;
+                row.denominator = prevMap.containsKey(dimVal) ? prevMap.get(dimVal) : 0;
+                // GRR caps numerator at denominator (max 100% retention per dimension)
+                row.numerator = (capNumerator && row.denominator > 0 && currVal > row.denominator)
+                    ? row.denominator : currVal;
+                row.value = row.denominator > 0 ?
+                    (row.numerator / row.denominator * 100).setScale(1, RoundingMode.HALF_UP) : 0;
+                rows.add(row);
+                grandCurr += row.numerator;
+                grandPrev += row.denominator;
+            }
+
+            Decimal overallNrr = grandPrev > 0 ?
+                (grandCurr / grandPrev * 100).setScale(2, RoundingMode.HALF_UP) : 0;
+
+            // Sort by current revenue DESC
+            for (Integer i = 1; i < rows.size(); i++) {
+                KpiRow key = rows[i];
+                Integer j = i - 1;
+                while (j >= 0 && rows[j].numerator < key.numerator) {
+                    rows[j + 1] = rows[j];
+                    j--;
+                }
+                rows[j + 1] = key;
+            }
+
+            String note = (String) kpiDef.get('interpretationNote');
+            String prevLabel = String.valueOf(prevStart) + ' to ' + String.valueOf(prevEnd);
+            result.resultsJson = buildPeriodRatioResultsJson(
+                kpiId, displayName, timeLabel, prevLabel, dimension, note,
+                rows, overallNrr, grandCurr, grandPrev);
         }
 
         System.debug('KPI_ENGINE: execution complete for ' + kpiId);
@@ -1391,6 +1498,40 @@ public with sharing class AiSalesAssistantController {
         for (KpiRow row : rows) {
             String rj = '{"group":"' + (row.groupValue != null ? String.escapeSingleQuotes(row.groupValue) : 'null') + '",' +
                 '"value":' + row.value + ',"dealCount":' + row.denominatorCount + '}';
+            rowJsons.add(rj);
+        }
+        json += String.join(rowJsons, ',') + ']}';
+        return json;
+    }
+
+    /**
+     * Builds results JSON for period-ratio KPIs (NRR, GRR).
+     */
+    private static String buildPeriodRatioResultsJson(
+        String kpiId, String displayName, String currentLabel, String previousLabel,
+        String dimension, String note,
+        List<KpiRow> rows, Decimal overallRate, Decimal grandCurr, Decimal grandPrev
+    ) {
+        String json = '{"kpi":"' + kpiId + '","displayName":"' + displayName + '",' +
+            '"currentPeriod":"' + currentLabel + '","previousPeriod":"' + previousLabel + '",' +
+            '"dimension":"' + dimension + '",' +
+            '"interpretationNote":"' + (note != null ? note : '') + '",' +
+            '"overall":{' +
+                '"rate":' + overallRate + ',' +
+                '"currentRevenue":' + grandCurr + ',' +
+                '"currentRevenue_display":"' + formatAsLakhs(grandCurr) + '",' +
+                '"previousRevenue":' + grandPrev + ',' +
+                '"previousRevenue_display":"' + formatAsLakhs(grandPrev) + '"' +
+            '},"rows":[';
+
+        List<String> rowJsons = new List<String>();
+        for (KpiRow row : rows) {
+            String rj = '{"group":"' + (row.groupValue != null ? String.escapeSingleQuotes(row.groupValue) : 'null') + '",' +
+                '"currentRevenue":' + row.numerator + ',' +
+                '"currentRevenue_display":"' + formatAsLakhs(row.numerator) + '",' +
+                '"previousRevenue":' + row.denominator + ',' +
+                '"previousRevenue_display":"' + formatAsLakhs(row.denominator) + '",' +
+                '"rate":' + row.value + '}';
             rowJsons.add(rj);
         }
         json += String.join(rowJsons, ',') + ']}';
@@ -1964,10 +2105,12 @@ public with sharing class AiSalesAssistantController {
         '  \'PF_Voice-C2C_(CRM)\',\'PF_Voice-Lead_Assist\',\'PF_Voice-Number_Masking\',\'PF_Voice-App2App\',\'PF_Voice-Voice_Blast\')\n' +
         '"Exoinsights"/"speech analytics"→INCLUDES(\'Technology-Cogno_Exoinsights\',\'Speech Log Analytics\')\n' +
         '"Cogno Omni"/"omnichannel"→INCLUDES(\'Conversational_AI-Cogno_Omni\',\'ECC_Ameyo_Omni\')\n\n' +
-        '=== LOST DEALS RULE ===\n' +
+        '=== LOST DEALS / LOSS ANALYSIS RULE ===\n' +
         'ALWAYS include ALL lost stages for loss queries:\n' +
         '  StageName IN (\'Closed Lost\',\'Closed-No decision\',\'Closed Unknown\',\'Closed Duplicate\',\'Rejected\',\'SDF Rejected\')\n' +
-        'NEVER use just StageName=\'Closed Lost\' alone — misses 40-50% of losses.\n\n' +
+        'NEVER use just StageName=\'Closed Lost\' alone — misses 40-50% of losses.\n' +
+        'Date field for loss analysis: use Opp_Actual_Closure_Date__c (NOT CloseDate).\n' +
+        'Loss analysis stages per CRM Buddy: Closed Unknown, Closed-No decision, Closed Lost, Closed Duplicate.\n\n' +
         '=== DO NOT USE (non-existent or dead fields) ===\n' +
         'NON-EXISTENT: MTTR__c, MTTR_Without_Start_Stop__c, Closed_Won(stage), Total_Contract_Value__c,\n' +
         '  Annual_Revenue__c(on Opp), Contract_Length__c, Renewal_Date__c(on Opp),\n' +
@@ -1990,9 +2133,14 @@ public with sharing class AiSalesAssistantController {
         '    WHERE Revenue_Booked_On__c >= [preceding_start] AND Revenue_Booked_On__c <= [preceding_end] AND Customer_Universal_Account__c != null\n' +
         '    GROUP BY Customer_Universal_Account__r.Cluster__c, Customer_Universal_Account__r.Name ORDER BY SUM(Revenue_Booked_Amount__c) DESC LIMIT 2000\n' +
         '  NRR = SUM(current) / SUM(preceding) x 100 (includes expansion/upsell).\n' +
-        '  GRR = same but excludes expansion (filter Revenue_Classification__c).\n' +
-        '  Variants: Monthly, Rolling 3M, Rolling 12M, YTD.\n' +
-        '  Also NRGP/GRGP = same formulas using GP__c instead of Revenue_Booked_Amount__c.\n' +
+        '    Only include dimensions where BOTH periods have revenue (exclude zero-revenue prior period).\n' +
+        '  GRR = same but: (1) filter Revenue_Classification__c IN (Retention 2, Retention 3),\n' +
+        '    (2) cap numerator at denominator per dimension (max 100%).\n' +
+        '  NRR variants (per CRM Buddy): This Month vs Same Month Last Year, Rolling 12M, YTD, QRR (YoY), QRR Rolling 3M.\n' +
+        '  NRGP (Net Revenue Growth Percentage): Current period GP / Previous period GP × 100.\n' +
+        '    Only Revenue_Classification = Retention 2, Retention 3. Includes expansion.\n' +
+        '  GRGP (Gross Revenue Growth Percentage): Same but numerator capped at denominator (max 100%).\n' +
+        '    Only Revenue_Classification = Retention 2, Retention 3 (numerator: Retention 3 only per CRM Buddy).\n' +
         '  Keyholes: Customer_Universal_Account__r.Region__c, Customer_Universal_Account__r.Cluster__c, Parent_SKU__c, SKU__c, AD/CSM.\n\n' +
         'GP / GROSS PROFIT — from Tableau Revenue Dashboard (accounts_revenue__c):\n' +
         '  ⚠️ SAME GOVERNOR LIMIT AS REVENUE. GP queries on accounts_revenue__c MUST split H1/H2.\n' +
@@ -2384,6 +2532,18 @@ public with sharing class AiSalesAssistantController {
                         // Check if the target domain is blocked before falling through.
                         // The planner's reason often hints at the actual domain (bookings, credits, etc.)
                         String reason = planResult.reason != null ? planResult.reason.toLowerCase() : '';
+                        String qLower = userQuestion.toLowerCase();
+
+                        // Mixed-intent detection: if the question mentions BOTH revenue keywords AND
+                        // a blocked domain, fall through to SOQL prompt to serve revenue data
+                        // (the summary will note what's unavailable)
+                        Set<String> revenueSignals = new Set<String>{
+                            'revenue', 'gp', 'gross profit', 'margin', 'cost'
+                        };
+                        Boolean hasRevenueIntent = false;
+                        for (String rs : revenueSignals) {
+                            if (qLower.contains(rs)) { hasRevenueIntent = true; break; }
+                        }
 
                         // Check all registered non-queryable domains
                         // If the reason mentions a blocked domain's keywords, block it here
@@ -2398,8 +2558,21 @@ public with sharing class AiSalesAssistantController {
                             if (String.isNotBlank(bd.DomainKeywords__c)) {
                                 for (String kw : bd.DomainKeywords__c.split(',')) {
                                     if (reason.contains(kw.trim().toLowerCase()) ||
-                                        userQuestion.toLowerCase().contains(kw.trim().toLowerCase())) {
-                                        // Match — block this question
+                                        qLower.contains(kw.trim().toLowerCase())) {
+                                        // If question ALSO has revenue intent, don't block —
+                                        // UNLESS the matched domain keyword itself contains the revenue signal
+                                        // (e.g., "booking to revenue" contains "revenue" — that's not mixed intent)
+                                        String matchedKw = kw.trim().toLowerCase();
+                                        Boolean kwContainsRevenueSignal = false;
+                                        for (String rs : revenueSignals) {
+                                            if (matchedKw.contains(rs)) { kwContainsRevenueSignal = true; break; }
+                                        }
+                                        if (hasRevenueIntent && !kwContainsRevenueSignal) {
+                                            System.debug('MIXED_INTENT: blocked domain "' +
+                                                bd.DeveloperName + '" detected but revenue intent present — falling through');
+                                            break;
+                                        }
+                                        // Pure blocked domain — block this question
                                         resp.success = true;
                                         resp.answer = String.isNotBlank(bd.UserMessageTemplate__c)
                                             ? bd.UserMessageTemplate__c
@@ -2412,6 +2585,8 @@ public with sharing class AiSalesAssistantController {
                                     }
                                 }
                             }
+                            // If we broke out of keyword loop due to mixed intent, stop checking other domains
+                            if (hasRevenueIntent && !blocked) break;
                         }
 
                         // Not blocked — fall through to legacy SOQL prompt
